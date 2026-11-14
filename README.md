@@ -1,6 +1,6 @@
 # textimg
 
-**Read text files as compact page images, for about half the tokens.**
+**Read text files as compact page images for about half the tokens, and edit them without reading them first.**
 
 Vision models charge for an image by its area (roughly `width × height / 750` tokens for Claude), not by how much text
 is in it. A 1932×1932 page of small, dense text holds far more characters than the same number of text tokens.
@@ -19,7 +19,8 @@ of a 23 MB, 300k-line log in 0.33 s. No cache, no server: every call renders fre
 ## Usage
 
 ```
-textimg FILE [-o OFFSET] [-n LIMIT] [--layout auto|packed|lines] [--max-pages N]
+textimg [read] FILE [-o OFFSET] [-n LIMIT] [--layout auto|packed|lines] [--max-pages N]
+textimg edit FILE [--all | --append | --create | --overwrite] [--patch PATCHFILE]   (text on stdin)
 ```
 
 It prints a header and one `PAGE` path per image; open them all with your image-reading tool (in Claude Code: the Read
@@ -63,6 +64,33 @@ It follows the contract of Claude Code's Read tool:
 
 The header shows the image cost next to a plain-text estimate, and a `NOTE:` says when plain text is as cheap (short
 files, code-heavy Markdown). Pages go to `%TEMP%\textimg\<stamp>\`; folders older than two hours are removed.
+
+## Editing without reading: `textimg edit`
+
+Claude Code's Edit and Write tools refuse to change a file that was not first read as text, which brings back the
+token cost. `textimg edit` is an exact find-and-replace run from the shell, so an agent takes the exact lines from
+`grep -n` or `sed -n 'A,Bp'` and changes them without reading the whole file:
+
+```
+textimg edit FILE <<'EOF'
+@@@OLD@@@
+exact old text
+@@@NEW@@@
+new text (leave empty to delete the old lines)
+@@@END@@@
+EOF
+```
+
+- Several blocks per call. All of them are checked before anything is written, so one failure writes nothing.
+- Each OLD must occur exactly once (`--all` replaces every occurrence).
+- On a miss it names the closest line.
+- On success it prints the changed lines with their numbers.
+- It keeps CRLF and LF line endings and a UTF-8 BOM, and replaces the file in one step, so a failed write never leaves it
+  half-written.
+- `--append`, `--create` and `--overwrite` take their text the same way.
+- **Backslashes:** Claude Code's Bash tool turns `\\` into `\` before the shell sees a command. So inline text that holds
+  a backslash is refused: write the same input to a new file with the Write tool (which keeps backslashes) and pass
+  `--patch FILE`. The patch file is deleted after it is read.
 
 ## Accuracy
 

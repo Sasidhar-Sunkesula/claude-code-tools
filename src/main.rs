@@ -1,6 +1,8 @@
 //! textimg: read a text file as compact page images (about a third of the tokens of plain text for prose).
 //! No dependencies: glyphs come from an embedded atlas (build_atlas.py: Verdana and Consolas 14px plus fallback
 //! fonts for symbols, CJK and Hangul); PNGs are written directly.
+mod edit;
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,7 +16,8 @@ const DOT: char = '\u{b7}';
 const PILCROW: char = '\u{b6}';
 const BAR: char = '\u{a6}';
 
-const HELP: &str = "textimg FILE [-o OFFSET] [-n LIMIT] [--layout auto|packed|lines] [--max-pages N]
+const HELP: &str = "textimg [read] FILE [-o OFFSET] [-n LIMIT] [--layout auto|packed|lines] [--max-pages N]
+textimg edit FILE ...   exact-text edits without reading the file first (textimg edit --help)
 
 Renders a text file as compact page images, then prints their paths. Open every PAGE path with the Read tool
 (all in one parallel call). About a third of the tokens of plain text for prose; reading is reliable for
@@ -467,7 +470,12 @@ fn die(msg: &str) -> ! { eprintln!("textimg: {}", msg); std::process::exit(1) }
 
 fn main() {
     let t0 = Instant::now();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(|s| s.as_str()) {
+        Some("edit") => { edit::main(&args[1..]); return; }
+        Some("read") => { args.remove(0); }
+        _ => {}
+    }
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") { println!("{}", HELP); return; }
     let (mut file, mut offset, mut limit, mut layout, mut max_pages) = (None, 1usize, 0usize, "auto".to_string(), 8usize);
     let mut i = 0;
