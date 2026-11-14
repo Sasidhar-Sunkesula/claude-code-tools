@@ -13,11 +13,14 @@ new text (leave empty to delete the old text with its line break)
 EOF
 
 Several OLD/NEW/END blocks may follow each other. Each OLD must occur exactly once (--all: every occurrence is
-replaced). All blocks are checked before anything is written: one failure writes nothing. Blocks apply in order.
+replaced). Every OLD is matched against the file as it was before this call, and blocks that overlap are refused
+(merge them into one block): a block never sees what another block of the same call wrote. All blocks are checked
+before anything is written: one failure writes nothing. A line that is exactly a marker cannot appear inside a block.
 
   textimg edit FILE --append     <<'EOF' ... EOF   the text goes at the end, on a new line
   textimg edit FILE --create     <<'EOF' ... EOF   a new file (refused if FILE exists)
   textimg edit FILE --overwrite  <<'EOF' ... EOF   replaces the whole file
+For these three the whole input is the text: no markers (a marker line in it is written as text).
 
 Use a QUOTED heredoc marker (<<'EOF') so the shell leaves $ and backticks alone.
 BACKSLASHES: Claude Code's Bash tool turns \\ into \ before the shell sees a command, so inline text holding any
@@ -155,33 +158,59 @@ pub fn main(args: &[String]) {
         println!("appended {} lines to {} at line {}", body.matches('\n').count(), path, start);
         return;
     }
+    // every OLD is located in the file as it was before this call; the blocks' regions may not overlap, so no block
+    // can match or undo text another block of the same call writes
+    let blocks = parse_blocks(&text);
+    let bytes = content.as_bytes();
+    let mut regions: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, block index)
+    let mut counts = Vec::with_capacity(blocks.len());
+    for (k, (old, new)) in blocks.iter().enumerate() {
+        if old.is_empty() { die(&format!("block {}: empty OLD text", k + 1)); }
+        let hits: Vec<usize> = content.match_indices(old.as_str()).map(|(i, _)| i).collect();
+        if hits.is_empty() { die(&format!("block {}: OLD text not found in {}{}; nothing written", k + 1, path, nearest(&content, old))); }
+        if hits.len() > 1 && !all { die(&format!("block {}: OLD text found {} times in {}; add context to make it unique, or pass --all; nothing written", k + 1, hits.len(), path)); }
+        counts.push(hits.len());
+        for &at in &hits {
+            let mut end = at + old.len();
+            // a whole-line removal takes its line break with it
+            if new.is_none() && bytes.get(end) == Some(&b'\n') && (at == 0 || bytes[at - 1] == b'\n') { end += 1; }
+            regions.push((at, end, k));
+        }
+    }
+    regions.sort();
+    for w in regions.windows(2) {
+        if w[1].0 < w[0].1 {
+            let (a, b) = (w[0].2.min(w[1].2) + 1, w[0].2.max(w[1].2) + 1);
+            die(&format!("blocks {} and {} overlap at line {} of the original file (every OLD is matched against the file before this call); merge them into one block; nothing written",
+                a, b, line_of(&content, w[1].0)));
+        }
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut first_line: Vec<Option<usize>> = vec![None; blocks.len()];
+    let (mut pos, mut lines) = (0usize, 0usize);
+    for &(a, b, k) in &regions {
+        lines += content[pos..a].matches('\n').count();
+        out.push_str(&content[pos..a]);
+        if first_line[k].is_none() { first_line[k] = Some(lines + 1); }
+        if let Some(new) = &blocks[k].1 { out.push_str(new); lines += new.matches('\n').count(); }
+        pos = b;
+    }
+    out.push_str(&content[pos..]);
     let mut report = Vec::new();
-    for (k, (old, new)) in parse_blocks(&text).into_iter().enumerate() {
-        let k = k + 1;
-        if old.is_empty() { die(&format!("block {}: empty OLD text", k)); }
-        let n = content.matches(old.as_str()).count();
-        if n == 0 { die(&format!("block {}: OLD text not found in {}{}; nothing written", k, path, nearest(&content, &old))); }
-        if n > 1 && !all { die(&format!("block {}: OLD text found {} times in {}; add context to make it unique, or pass --all; nothing written", k, n, path)); }
-        let at = content.find(old.as_str()).unwrap();
-        let line = line_of(&content, at);
+    for (k, (old, new)) in blocks.iter().enumerate() {
+        let (line, n) = (first_line[k].unwrap(), counts[k]);
+        let places = if n > 1 { format!(" ({} places; first shown)", n) } else { String::new() };
         match new {
-            None => {
-                // a whole-line removal takes its line break with it
-                let whole = |s: &str, a: usize| s[a + old.len()..].starts_with('\n') && (a == 0 || s.as_bytes()[a - 1] == b'\n');
-                let target = if whole(&content, at) { format!("{}\n", old) } else { old.clone() };
-                content = if all { content.replace(target.as_str(), "") } else { format!("{}{}", &content[..at], &content[at + target.len()..]) };
-                report.push(format!("block {}: deleted {} line(s) at line {}{}", k, old.matches('\n').count() + 1, line, if n > 1 { format!(" ({} places)", n) } else { String::new() }));
-            }
+            None => report.push(format!("block {}: deleted {} line(s) at line {}{}", k + 1, old.matches('\n').count() + 1, line, places)),
             Some(new) => {
-                content = if all { content.replace(old.as_str(), &new) } else { format!("{}{}{}", &content[..at], new, &content[at + old.len()..]) };
                 let shown: Vec<&str> = new.split('\n').collect();
-                let mut r = format!("block {}: lines {}-{}{}:", k, line, line + shown.len() - 1, if n > 1 { format!(" (first of {} places)", n) } else { String::new() });
+                let mut r = format!("block {}: lines {}-{}{}:", k + 1, line, line + shown.len() - 1, places);
                 for (j, l) in shown.iter().take(12).enumerate() { r.push_str(&format!("\n  {}: {}", line + j, l)); }
-                if shown.len() > 12 { r.push_str("\n  ..."); }
+                if shown.len() > 12 { r.push_str(&format!("\n  ... ({} more lines)", shown.len() - 12)); }
                 report.push(r);
             }
         }
     }
-    write(p, &content, bom, crlf);
+    write(p, &out, bom, crlf);
     println!("edited {}\n{}", path, report.join("\n"));
 }

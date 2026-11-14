@@ -83,11 +83,14 @@ EOF
 
 - Several blocks per call. All of them are checked before anything is written, so one failure writes nothing.
 - Each OLD must occur exactly once (`--all` replaces every occurrence).
+- Every OLD is matched against the file as it was before the call, and blocks whose regions overlap are refused, so one
+  block can never match or undo what another block of the same call wrote. Merge overlapping edits into one block.
 - On a miss it names the closest line.
 - On success it prints the changed lines with their numbers.
 - It keeps CRLF and LF line endings and a UTF-8 BOM, and replaces the file in one step, so a failed write never leaves it
   half-written.
-- `--append`, `--create` and `--overwrite` take their text the same way.
+- `--append`, `--create` and `--overwrite`: the whole input is the text, with no markers.
+- A line that is exactly a marker cannot appear inside a block (write such a file with `--overwrite`).
 - **Backslashes:** Claude Code's Bash tool turns `\\` into `\` before the shell sees a command. So inline text that holds
   a backslash is refused: write the same input to a new file with the Write tool (which keeps backslashes) and pass
   `--patch FILE`. The patch file is deleted after it is read.
