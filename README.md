@@ -94,6 +94,7 @@ EOF
 - **Backslashes:** Claude Code's Bash tool turns `\\` into `\` before the shell sees a command. So inline text that holds
   a backslash is refused: write the same input to a new file with the Write tool (which keeps backslashes) and pass
   `--patch FILE`. The patch file is deleted after it is read.
+- **Long text** (over ~5 KB): use `--patch` too; a ~13 KB inline heredoc failed inside the Bash tool before textimg ran.
 
 ## Accuracy
 
