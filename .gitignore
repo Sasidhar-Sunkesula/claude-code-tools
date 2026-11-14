@@ -1,0 +1,6 @@
+/target/
+__pycache__/
+# built locally: the glyph atlas comes from your own installed fonts and is not redistributed
+/src/atlas.bin
+/textimg.exe
+/textimg
