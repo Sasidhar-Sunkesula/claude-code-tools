@@ -2,6 +2,7 @@
 //! No dependencies: glyphs come from an embedded atlas (build_atlas.py: Verdana and Consolas 14px plus fallback
 //! fonts for symbols, CJK and Hangul); PNGs are written directly.
 mod edit;
+mod mcp;
 
 use std::fs;
 use std::io::Write;
@@ -18,6 +19,7 @@ const BAR: char = '\u{a6}';
 
 const HELP: &str = "textimg [read] FILE [-o OFFSET] [-n LIMIT] [--layout auto|packed|lines] [--max-pages N]
 textimg edit FILE ...   exact-text edits without reading the file first (textimg edit --help)
+textimg mcp             stdio MCP server: tools read (header and all pages in one call) and edit
 
 Renders a text file as compact page images, then prints their paths. Open every PAGE path with the Read tool
 (all in one parallel call). About a third of the tokens of plain text for prose; reading is reliable for
@@ -473,6 +475,7 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("edit") => { edit::main(&args[1..]); return; }
+        Some("mcp") => { mcp::main(); return; }
         Some("read") => { args.remove(0); }
         _ => {}
     }
@@ -492,26 +495,67 @@ fn main() {
         }
         i += 1;
     }
-    let packed = match layout.as_str() { "packed" | "auto" => true, "lines" => false, _ => die("layout must be auto, packed or lines") };
-    let path = PathBuf::from(file.unwrap_or_else(|| die("no file given")));
-    if !path.exists() { die(&format!("File does not exist: {}", path.display())); }
-    if path.is_dir() { die(&format!("{} is a directory, not a file; list it with ls or Glob.", path.display())); }
-    let ap = fs::canonicalize(&path).unwrap_or_else(|e| die(&format!("{}: {}", path.display(), e)));
+    match render(&file.unwrap_or_else(|| die("no file given")), offset, limit, &layout, max_pages, t0) {
+        Err(e) => die(&e),
+        Ok(r) => {
+            if let Some(m) = &r.info { println!("{}", m); return; }
+            // fresh output folder; folders older than two hours are removed
+            let base = std::env::temp_dir().join("textimg");
+            if let Ok(rd) = fs::read_dir(&base) {
+                for e in rd.flatten() {
+                    if let Ok(m) = e.metadata() { if m.modified().ok().and_then(|t| t.elapsed().ok()).map_or(false, |d| d.as_secs() > 7200) { let _ = fs::remove_dir_all(e.path()); } }
+                }
+            }
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            let out = base.join(format!("{}_{}", stamp, std::process::id()));
+            fs::create_dir_all(&out).unwrap_or_else(|e| die(&format!("cannot create {}: {}", out.display(), e)));
+            let so = std::io::stdout();
+            let mut o = so.lock();
+            for l in &r.head { let _ = writeln!(o, "{}", l); }
+            let _ = writeln!(o, "Read every PAGE below with the Read tool (one parallel call). {}", r.legend);
+            for (n, (png, a, b)) in r.pages.iter().enumerate() {
+                let f = out.join(format!("p{:02}.png", n + 1));
+                fs::write(&f, png).unwrap_or_else(|e| die(&format!("cannot write {}: {}", f.display(), e)));
+                let _ = writeln!(o, "PAGE {}  (lines {}-{})", f.display(), a, b);
+            }
+            for l in &r.notes { let _ = writeln!(o, "{}", l); }
+            if let Some(m) = r.more { let _ = writeln!(o, "MORE: run again with -o {} to continue.", m); }
+        }
+    }
+}
+
+pub struct Rendered {
+    pub info: Option<String>,                 // a message instead of pages (empty file, empty range)
+    pub head: Vec<String>,                    // the header line and a cost NOTE
+    pub legend: String,                       // how to read the pages
+    pub pages: Vec<(Vec<u8>, usize, usize)>,  // PNG bytes, first and last line on the page
+    pub notes: Vec<String>,                   // missing glyphs, linked images, a cut-off long line
+    pub more: Option<usize>,                  // the offset to continue from
+}
+
+pub fn render(file: &str, offset: usize, limit: usize, layout: &str, max_pages: usize, t0: Instant) -> Result<Rendered, String> {
+    let max_pages = max_pages.max(1);
+    let packed = match layout { "packed" | "auto" | "" => true, "lines" => false, _ => return Err("layout must be auto, packed or lines".into()) };
+    let path = PathBuf::from(file);
+    if !path.exists() { return Err(format!("File does not exist: {}", path.display())); }
+    if path.is_dir() { return Err(format!("{} is a directory, not a file; list it with ls or Glob.", path.display())); }
+    let ap = fs::canonicalize(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
     let disp = clean(&ap);
     let ext = ap.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     const USE_READ: [&str; 26] = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "pdf", "ipynb", "docx", "xlsx", "pptx",
         "doc", "xls", "ppt", "zip", "gz", "7z", "rar", "tar", "exe", "dll", "so", "bin"];
-    if USE_READ.contains(&ext.as_str()) { die(&format!("{} is not a text file; use the Read tool (it shows images, PDFs and notebooks).", disp)); }
-    let raw = fs::read(&ap).unwrap_or_else(|e| die(&format!("{}: {}", disp, e)));
+    if USE_READ.contains(&ext.as_str()) { return Err(format!("{} is not a text file; use the Read tool (it shows images, PDFs and notebooks).", disp)); }
+    let raw = fs::read(&ap).map_err(|e| format!("{}: {}", disp, e))?;
     let utf16 = raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF]);
-    if !utf16 && raw[..raw.len().min(8192)].contains(&0) { die(&format!("{} looks binary; use the Read tool.", disp)); }
+    if !utf16 && raw[..raw.len().min(8192)].contains(&0) { return Err(format!("{} looks binary; use the Read tool.", disp)); }
     let text = decode(&raw);
     let mut lines: Vec<String> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l).to_string()).collect();
     if lines.last().map_or(false, |l| l.is_empty()) { lines.pop(); }
     let total = lines.len();
-    if total == 0 { println!("textimg: {} exists but is empty (0 lines).", disp); return; }
+    let mut r = Rendered { info: None, head: vec![], legend: String::new(), pages: vec![], notes: vec![], more: None };
+    if total == 0 { r.info = Some(format!("textimg: {} exists but is empty (0 lines).", disp)); return Ok(r); }
     let s = offset.max(1);
-    if s > total { die(&format!("{} has only {} lines; offset {} is past the end.", disp, total, s)); }
+    if s > total { return Err(format!("{} has only {} lines; offset {} is past the end.", disp, total, s)); }
     let end = if limit > 0 { (s - 1 + limit).min(total) } else { total };
     let markdown = ["md", "markdown", "mdx", "rst"].contains(&ext.as_str());
     let (lh, faces) = load_atlas();
@@ -525,54 +569,38 @@ fn main() {
         if m <= s { long_first = true; Some(s + 1) } else { Some(m) }
     } else { None };
     let shown = &rows[..rows.len().min(cut)];
-    if shown.is_empty() { println!("textimg: {} | lines {}-{} of {} are all empty.", disp, s, end, total); return; }
-    // fresh output folder; folders older than two hours are removed
-    let base = std::env::temp_dir().join("textimg");
-    if let Ok(rd) = fs::read_dir(&base) {
-        for e in rd.flatten() {
-            if let Ok(m) = e.metadata() { if m.modified().ok().and_then(|t| t.elapsed().ok()).map_or(false, |d| d.as_secs() > 7200) { let _ = fs::remove_dir_all(e.path()); } }
-        }
-    }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-    let out = base.join(format!("{}_{}", stamp, std::process::id()));
-    fs::create_dir_all(&out).unwrap_or_else(|e| die(&format!("cannot create {}: {}", out.display(), e)));
+    if shown.is_empty() { r.info = Some(format!("textimg: {} | lines {}-{} of {} are all empty.", disp, s, end, total)); return Ok(r); }
     let mut px = 0usize;
-    let mut listed = Vec::new();
     let pages: Vec<&[Row]> = shown.chunks(per).collect();
     for (n, p) in pages.iter().enumerate() {
         let h = if n + 1 < pages.len() || p.len() == per { H } else { 2 * MARGIN + lh * p.len() };
         let buf = draw(&faces, p, lh, h);
-        let f = out.join(format!("p{:02}.png", n + 1));
-        fs::write(&f, png(&buf, h)).unwrap_or_else(|e| die(&format!("cannot write {}: {}", f.display(), e)));
         px += W * h;
-        listed.push((f, p[0].first, p.iter().map(|r| r.last).max().unwrap()));
+        r.pages.push((png(&buf, h), p[0].first, p.iter().map(|r| r.last).max().unwrap()));
     }
     let shown_end = match more { Some(m) => m - 1, None => end };
-    let last_drawn = listed.last().map_or(s, |l| l.2);
-    let est = px / 750 + 70 * listed.len();
+    let last_drawn = r.pages.last().map_or(s, |l| l.2);
+    let est = px / 750 + 70 * r.pages.len();
     let shown_bytes: usize = lines[s - 1..shown_end].iter().map(|l| l.len() + 1).sum::<usize>()
         .min(shown.iter().map(|r| r.text.len()).sum()); // a cut-off long line counts only its shown part
     let text_est = shown_bytes * 10 / 28; // plain text runs about 2.8 bytes per token on these files
-    let so = std::io::stdout();
-    let mut o = so.lock();
-    let _ = writeln!(o, "textimg: {} | lines {}-{} of {} | {} layout | {} page(s) | ~{} tokens (plain text ~{}) | {} ms",
-        disp, s, shown_end, total, if packed { "packed" } else { "lines" }, listed.len(), est, text_est, t0.elapsed().as_millis());
-    if est * 10 > text_est * 9 { let _ = writeln!(o, "NOTE: images save little or nothing here; the plain Read tool is as cheap and exact."); }
-    let marker = if packed { "\u{b6}N starts line N; a row starting with \u{a6}N continues line N (the label is not text); a line number that never appears is an empty line" } else { "N\u{2502} starts line N" };
-    let _ = writeln!(o, "Read every PAGE below with the Read tool (one parallel call). {}; \u{b7} = one space.", marker);
-    for (f, a, b) in &listed { let _ = writeln!(o, "PAGE {}  (lines {}-{})", f.display(), a, b); }
+    r.head.push(format!("textimg: {} | lines {}-{} of {} | {} layout | {} page(s) | ~{} tokens (plain text ~{}) | {} ms",
+        disp, s, shown_end, total, if packed { "packed" } else { "lines" }, r.pages.len(), est, text_est, t0.elapsed().as_millis()));
+    if est * 10 > text_est * 9 { r.head.push("NOTE: images save little or nothing here; the plain Read tool is as cheap and exact.".into()); }
+    r.legend = format!("{}; \u{b7} = one space.", if packed { "\u{b6}N starts line N; a row starting with \u{a6}N continues line N (the label is not text); a line number that never appears is an empty line" } else { "N\u{2502} starts line N" });
     let miss: Vec<&(usize, usize)> = missing.iter().filter(|m| m.0 <= last_drawn).collect();
     if !miss.is_empty() {
         let n: usize = miss.iter().map(|m| m.1).sum();
         let at: Vec<usize> = miss.iter().map(|m| m.0).collect();
-        let _ = writeln!(o, "NOTE: {} character(s) this font set cannot draw are shown as ? on line(s) {}; read those lines with the text Read tool.", n, ranges(&at, 12));
+        r.notes.push(format!("NOTE: {} character(s) this font set cannot draw are shown as ? on line(s) {}; read those lines with the text Read tool.", n, ranges(&at, 12)));
     }
     if markdown {
         let dir = ap.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let (found, remote) = image_links(&lines[s - 1..last_drawn.min(total)], &dir);
-        if !found.is_empty() { let _ = writeln!(o, "IMAGES linked in these lines (not drawn; open with Read if needed): {}", found.join(" ; ")); }
-        if remote > 0 { let _ = writeln!(o, "NOTE: {} remote image link(s) not fetched.", remote); }
+        if !found.is_empty() { r.notes.push(format!("IMAGES linked in these lines (not drawn; open with Read if needed): {}", found.join(" ; "))); }
+        if remote > 0 { r.notes.push(format!("NOTE: {} remote image link(s) not fetched.", remote)); }
     }
-    if long_first { let _ = writeln!(o, "NOTE: line {} is longer than {} page(s); only its start is shown (raise --max-pages, or use the text Read).", s, max_pages); }
-    if let Some(m) = more { if m <= end { let _ = writeln!(o, "MORE: run again with -o {} to continue.", m); } }
+    if long_first { r.notes.push(format!("NOTE: line {} is longer than {} page(s); only its start is shown (raise max pages, or use the text Read).", s, max_pages)); }
+    r.more = more.filter(|&m| m <= end);
+    Ok(r)
 }

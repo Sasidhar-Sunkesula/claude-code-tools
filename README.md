@@ -141,3 +141,14 @@ Read large text files with textimg: run `textimg FILE [-o N] [-n N]`, then open 
 Read tool in one parallel call; on MORE, rerun with -o N. Use plain Read for small files, exact quotes, numbers you
 will copy, and the text you are about to edit.
 ```
+
+## MCP mode: one call per read
+
+`textimg mcp` runs the same binary as a stdio MCP server with two tools. `read` returns the header and every page
+image in one tool result, so no separate Read call is needed; `edit` is `textimg edit` with JSON arguments, so the Bash
+tool's backslash and heredoc limits no longer apply. Register it with
+`claude mcp add textimg -- C:\path\to\textimg.exe mcp`.
+
+`read` defaults to 4 pages (about 20k tokens) because Claude Code warns above 25k tokens of MCP output. Set
+`MAX_MCP_OUTPUT_TOKENS=50000` to use `max_pages` 8. Tested with Opus 5.5: all 8 full-size pages arrived without being
+downscaled (about 41k tokens), and the line it was asked to read back was copied exactly.
