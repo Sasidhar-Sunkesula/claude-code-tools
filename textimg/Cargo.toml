@@ -3,7 +3,7 @@ name = "textimg"
 version = "0.1.0"
 edition = "2021"
 description = "Render text files as compact page images so vision LLM agents read them for about half the tokens"
-repository = "https://github.com/Sasidhar-Sunkesula/textimg"
+repository = "https://github.com/Sasidhar-Sunkesula/claude-code-tools"
 
 [dependencies]
 

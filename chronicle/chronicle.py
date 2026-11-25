@@ -35,7 +35,7 @@ DEFAULTS = {
     "state_dir": "docs/chronicle/.tool",
     "claude": "",                 # path of the claude CLI ("" = from PATH)
     "inject": "import",           # import: CLAUDE.md imports now.md as text; images: the session reads now.md through textimg
-    "textimg": os.path.join(os.path.dirname(HERE), "textimg.exe" if os.name == "nt" else "textimg"),  # the repo's build
+    "textimg": os.path.join(os.path.dirname(HERE), "textimg", "textimg.exe" if os.name == "nt" else "textimg"),  # the repo's build
 }
 SKIP_ATTACH = {"output_style", "deferred_tools_record", "deferred_tools_delta", "skill_listing", "agent_listing_delta",
                "prompt_snapshot", "environment", "model", "output_style_instructions", "session_context", "date",

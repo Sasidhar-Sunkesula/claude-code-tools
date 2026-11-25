@@ -93,11 +93,11 @@ The mind project's docs/log.md (1,811 entries) became 74 such records, plus 4 in
 
 ```json
 "hooks": {
-  "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "python /path/to/textimg/chronicle/chronicle.py hook", "timeout": 30}]}],
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python /path/to/textimg/chronicle/chronicle.py hook", "timeout": 30}]}],
-  "Stop": [{"hooks": [{"type": "command", "command": "python /path/to/textimg/chronicle/chronicle.py hook", "timeout": 30}]}],
-  "PreCompact": [{"hooks": [{"type": "command", "command": "python /path/to/textimg/chronicle/chronicle.py hook", "timeout": 1600}]}],
-  "SessionStart": [{"hooks": [{"type": "command", "command": "python /path/to/textimg/chronicle/chronicle.py hook", "timeout": 60}]}]
+  "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 30}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 30}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 30}]}],
+  "PreCompact": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 1600}]}],
+  "SessionStart": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 60}]}]
 }
 ```
 
