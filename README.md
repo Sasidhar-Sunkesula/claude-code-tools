@@ -152,3 +152,12 @@ tool's backslash and heredoc limits no longer apply. Register it with
 `read` defaults to 4 pages (about 20k tokens) because Claude Code warns above 25k tokens of MCP output. Set
 `MAX_MCP_OUTPUT_TOKENS=50000` to use `max_pages` 8. Tested with Opus 5.5: all 8 full-size pages arrived without being
 downscaled (about 41k tokens), and the line it was asked to read back was copied exactly.
+
+## chronicle: memory across compactions
+
+`chronicle/` holds a companion tool that gives a long Claude Code session full-fidelity memory across compactions:
+- a separate model records the session part by part from its raw transcript, keeping user messages verbatim;
+- at each compaction a background fork writes the session's own summary;
+- after the compaction, the session reads it all back through textimg.
+
+See [chronicle/README.md](chronicle/README.md).
