@@ -30,7 +30,7 @@ DEFAULTS = {
     "budget_tokens": 150000,      # size of now.md
     "full_tokens": 110000,        # of which: the most recent records in full
     "days": 7,                    # older records appear in now.md's index only
-    "precompact_wait": 90,        # seconds PreCompact waits for the tail's record (0 when another recording runs)
+    "precompact_wait": 0,         # seconds PreCompact waits for the tail's record (a record takes 2-8 min: not worth holding a compaction)
     "records_dir": "docs/chronicle",
     "state_dir": "docs/chronicle/.tool",
     "claude": "",                 # path of the claude CLI ("" = from PATH)
@@ -680,7 +680,8 @@ def _record(pj, transcript, final, start_segments):
 FORK_PROMPT = ("Write a summary of this conversation's work since the last compaction only; everything before that "
                "compaction is already recorded elsewhere. Cover: the user's requests in this stretch; what was done and "
                "found, with exact numbers, files and commands; the decisions made and why; the approaches considered and "
-               "set aside. Do not use any tools. Output only the summary.")
+               "set aside. Record only what happened: no next steps, plans, open questions or to-do lists. Do not use "
+               "any tools. Output only the summary.")
 
 
 def forksum_snapshot(pj, transcript):
@@ -691,6 +692,34 @@ def forksum_snapshot(pj, transcript):
     return cid
 
 
+FORK_MARGINS = (20_000, 60_000, 150_000)  # tokens the fork's copy is cut back by, in turn, when the session had filled its context window
+
+
+def fork_turns(path):
+    """Where each of the chat's own API responses starts in a transcript (byte offset, the context it was sent with,
+    its time), and the offset of the last compaction boundary."""
+    turns, seen, boundary, off = [], set(), 0, 0
+    with open(path, "rb") as fh:
+        for raw in fh:
+            # anywhere in the line: newer transcripts put the message before "type" in assistant entries
+            if b'"compact_boundary"' in raw or b'"type":"assistant"' in raw:
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    d = {}
+                if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+                    boundary = off
+                elif d.get("type") == "assistant":
+                    m = d.get("message") or {}
+                    u = m.get("usage") or {}
+                    if u and m.get("id") not in seen and str(m.get("model", "")).startswith("claude"):
+                        seen.add(m.get("id"))
+                        turns.append((off, u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                                      + u.get("cache_read_input_tokens", 0), d.get("timestamp", "")))
+            off += len(raw)
+    return turns, boundary
+
+
 def forksum(transcript, cid, project=None):
     """The chat's own model, in a fork of the copied session (its full context, from cache), writes a summary of the
     stretch since the last compaction; it is saved verbatim as a record and the copy and the fork are removed."""
@@ -699,18 +728,20 @@ def forksum(transcript, cid, project=None):
         return 1
     pj = Project(root)
     folder = os.path.dirname(transcript)
-    made = [os.path.join(folder, cid + ".jsonl"), os.path.join(folder, cid)]
+    copy = os.path.join(folder, cid + ".jsonl")
+    made = [copy, os.path.join(folder, cid)]
+    model, upto, cut, text = None, "", None, ""
     try:
-        model, end = None, None
-        size = os.path.getsize(made[0])
-        with open(made[0], "rb") as fh:
+        size = os.path.getsize(copy)
+        with open(copy, "rb") as fh:
             fh.seek(max(0, size - 30_000_000))
             for raw in fh:
-                if b'"type":"assistant"' in raw[:4000]:
+                if b'"type":"assistant"' in raw:
                     try:
                         d = json.loads(raw)
-                        model = d["message"].get("model") or model
-                        end = d.get("timestamp") or end
+                        m = d["message"].get("model") or ""
+                        if d.get("type") == "assistant" and m.startswith("claude"):  # not a "<synthetic>" error message
+                            model, upto = m, d.get("timestamp") or upto
                     except Exception:
                         pass
         claude = pj.cfg["claude"] or shutil.which("claude") or "claude"
@@ -719,65 +750,99 @@ def forksum(transcript, cid, project=None):
                 "--max-turns", "1", "--output-format", "json", "--settings", json.dumps({"disableAllHooks": True})]
         if model:
             args += ["--model", model]
+
+        def run():
+            r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", env=env, cwd=root,
+                               stdin=subprocess.DEVNULL, timeout=3600)
+            res = {}
+            for line in reversed(r.stdout.strip().splitlines()):
+                try:
+                    res = json.loads(line)
+                    break
+                except Exception:
+                    continue
+            fork = res.get("session_id")
+            if fork:
+                made.extend([os.path.join(folder, fork + ".jsonl"), os.path.join(folder, fork)])
+            out = (res.get("result") or "").strip()
+            if len(out) <= 200 and fork and os.path.exists(os.path.join(folder, fork + ".jsonl")):
+                # the summary is the fork's first message after our prompt (a hook or the turn limit may end the run later)
+                seen_prompt = False
+                for line in open(os.path.join(folder, fork + ".jsonl"), encoding="utf-8"):
+                    d = json.loads(line)
+                    if d.get("type") == "user" and d.get("message", {}).get("content") == FORK_PROMPT:
+                        seen_prompt = True
+                    elif seen_prompt and d.get("type") == "assistant":
+                        t = "".join(b.get("text", "") for b in d["message"]["content"] if b.get("type") == "text").strip()
+                        if len(t) > 200:
+                            out = t
+                            break
+            return r, res, out
+
+        if not model:
+            pj.log("forksum: the chat's model was not found in the transcript; no summary (another model would not "
+                   "share the session's cache)")
+            return 1
         t0 = time.time()
-        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", env=env, cwd=root,
-                           stdin=subprocess.DEVNULL, timeout=3600)
-        res = {}
-        for line in reversed(r.stdout.strip().splitlines()):
-            try:
-                res = json.loads(line)
-                break
-            except Exception:
-                continue
-        fork = res.get("session_id")
-        if fork:
-            made += [os.path.join(folder, fork + ".jsonl"), os.path.join(folder, fork)]
-        text = (res.get("result") or "").strip()
-        if not text and fork and os.path.exists(made[-2]):
-            # the summary is the fork's first message after our prompt (a hook or the turn limit may end the run later)
-            seen_prompt = False
-            for line in open(made[-2], encoding="utf-8"):
-                d = json.loads(line)
-                if d.get("type") == "user" and d.get("message", {}).get("content") == FORK_PROMPT:
-                    seen_prompt = True
-                elif seen_prompt and d.get("type") == "assistant":
-                    t = "".join(b.get("text", "") for b in d["message"]["content"] if b.get("type") == "text").strip()
-                    if len(t) > 200:
-                        text = t
-                        break
+        r, res, text = run()
+        if "prompt is too long" in text.lower():
+            # the session had filled its context window (it compacted because it ran out): the copy is cut back to the
+            # last of its turns that fits, a little further each try; the work after the cut is in the separate model's
+            # records. A turn that recent is still in the session's cache.
+            turns, boundary = fork_turns(copy)
+            turns = [t for t in turns if t[0] > boundary]
+            for margin in FORK_MARGINS:
+                fit = [t for t in turns if t[1] <= turns[-1][1] - margin]
+                if not fit:
+                    break
+                cut = fit[-1]
+                with open(copy, "r+b") as fh:
+                    fh.truncate(cut[0])
+                pj.log(f"forksum: the context was full ({turns[-1][1]} tokens); retrying on the copy cut back to "
+                       f"{local(cut[2])} ({cut[1]} tokens)")
+                r, res, text = run()
+                if "prompt is too long" not in text.lower():
+                    break
         u = res.get("usage", {})
         pj.log(f"forksum: {model} in {time.time() - t0:.0f}s, cache read {u.get('cache_read_input_tokens')}, "
                f"written {u.get('cache_creation_input_tokens')}, out {u.get('output_tokens')}, summary {len(text)} chars")
-        if not text:
-            pj.log("forksum: no summary came back: " + (r.stderr or r.stdout)[-400:])
-            return 1
-        now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        name = "sessions/" + datetime.datetime.now().strftime("%Y-%m-%d_%H%M") + "_own-summary.md"
-        body = (f"# The chat's own summary of its work before the compaction at {now_iso()[:16].replace('T', ' ')}\n"
-                f"- Written by {model}, the chat's own model, in a background copy of the session with its whole context; "
-                f"saved verbatim.\n\n{text}\n")
-        if not take_lock(pj, 7200):
-            pj.log("forksum: the lock stayed held; the summary was not saved")
-            return 1
-        try:
-            os.makedirs(os.path.join(pj.rec_dir, "sessions"), exist_ok=True)
-            with open(os.path.join(pj.rec_dir, name), "w", encoding="utf-8", newline="\n") as f:
-                f.write(body)
-            st = pj.load()
-            st.setdefault("records", []).append({"file": name, "segment": "own-summary", "kind": "own-summary",
-                                                 "start": now_utc, "end": now_utc, "tokens_in": 0, "chars": len(body),
-                                                 "first_user": "the chat's own summary before the compaction"})
-            pj.save(st)
-            rebuild(pj)
-        finally:
-            drop_lock(pj)
-        return 0
+        if len(text) <= 200 or res.get("is_error"):
+            pj.log("forksum: no summary came back: " + (text or r.stderr or r.stdout)[-400:])
+            text = ""
     finally:
-        for p in made:
+        for p in made:  # removed before any wait for the lock: the copy is as large as the session
             try:
                 shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
             except OSError:
                 pass
+    if not text:
+        return 1
+    if cut:
+        upto = cut[2]
+    upto = upto or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    name = f"sessions/{local(upto, '%Y-%m-%d_%H%M')}_own-summary.md"
+    body = (f"# The chat's own summary of its work up to {local(upto)}, written at the compaction\n"
+            f"- Written by {model}, the chat's own model, in a background copy of the session with its whole context; "
+            f"saved verbatim.\n"
+            + (f"- The session had filled its context window, so the copy was cut back to {local(upto)}; the work after "
+               f"that is in the separate model's records.\n" if cut else "")
+            + f"\n{text}\n")
+    if not take_lock(pj, 7200):
+        pj.log("forksum: the lock stayed held; the summary was not saved")
+        return 1
+    try:
+        os.makedirs(os.path.join(pj.rec_dir, "sessions"), exist_ok=True)
+        with open(os.path.join(pj.rec_dir, name), "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+        st = pj.load()
+        st.setdefault("records", []).append({"file": name, "segment": "own-summary", "kind": "own-summary",
+                                             "start": upto, "end": upto, "tokens_in": 0, "chars": len(body),
+                                             "first_user": "the chat's own summary before the compaction"})
+        pj.save(st)
+        rebuild(pj)
+    finally:
+        drop_lock(pj)
+    return 0
 
 
 def finish_final(pj):
@@ -1148,7 +1213,8 @@ def scan_growth(st, transcript):
         head = raw[:300]
         if not raw or b'"api-request' in head or b'"isSidechain":true' in head:
             continue
-        if b'"type":"assistant"' in raw[:4000] or b'"type":"user"' in raw[:4000] or b'"type":"attachment"' in raw[:4000]:
+        # "type" is searched in the whole line: newer transcripts put the message before it in assistant entries
+        if b'"type":"assistant"' in raw or b'"type":"user"' in raw[:4000] or b'"type":"attachment"' in raw[:4000]:
             try:
                 d = json.loads(raw)
             except Exception:
@@ -1248,7 +1314,9 @@ def hook():
         pj.save_hook(hs)
         rebuild(pj)
         return 0
-    elif ev == "SessionStart":
+    elif ev == "SessionStart" and inp.get("source") in ("compact", "clear"):
+        # only when the context was just emptied: a resumed session (the app restarting it) still holds everything, and
+        # being told to reread now.md there doubles it in the context
         recs = st.get("records", [])
         if recs and pj.cfg.get("inject") == "images":
             now = os.path.join(pj.rec_dir, "now.md").replace("\\", "/")
@@ -1328,7 +1396,7 @@ def main():
         print(f"now.md: {rebuild(pj)} chars")
         return 0
     if a[0] == "status":
-        status(find_root(a[1]) or a[1])
+        status(find_root(a[1] if len(a) > 1 else os.getcwd()) or (a[1] if len(a) > 1 else os.getcwd()))
         return 0
     print(__doc__)
     return 1

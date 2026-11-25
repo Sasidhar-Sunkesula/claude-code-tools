@@ -27,10 +27,9 @@ those records, not just the summary.
    - **Carry forward**: instructions in force, decisions with reasons, numbers, dead ends.
    User messages and the assistant's messages to the user are inserted **verbatim by the program** at the model's
    `{{T#}}` / `{{R#}}` placeholders, so they can't be paraphrased; any the model skips are inserted anyway.
-4. **Before a compaction**, the `PreCompact` hook starts recording the remaining tail and waits up to `precompact_wait`
-   (default 90 s). If another recording is already running, it doesn't wait at all, so a compaction is never held
-   for long. If the tail isn't done in time, it finishes in the background, and the next tool call tells the session
-   to read it.
+4. **Before a compaction**, the `PreCompact` hook starts recording the remaining tail. By default it doesn't wait
+   (`precompact_wait` 0 s): a tail takes 2–8 minutes to record, too long to hold a compaction for. The tail finishes
+   in the background, and the next tool call or message tells the session to read it.
 5. **`now.md`** is rebuilt after every record, within `budget_tokens`:
    - the most recent records in full (up to `full_tokens`);
    - earlier records of the last `days` as their user messages (verbatim) plus their carried-forward lists;
@@ -59,6 +58,11 @@ prefix is identical, the fork reads the session's whole context from cache, thin
 summary of the stretch since the last compaction: requests, what was done and found, decisions and why, approaches set
 aside. The answer is saved verbatim as `sessions/<date>_<time>_own-summary.md`, and the copy and the fork are deleted.
 In a test on a 605k-token context, it read 605,651 tokens from cache and wrote a 13k-character summary.
+
+If the session compacted because its context window was full ("Prompt is too long"), the fork can't fit either. The
+copy is then cut back to the last of the chat's turns that is at least 60k tokens smaller, and the fork runs again.
+The record says where it stops, and the work after that point is covered by the separate model's records. An
+error message is never saved as a summary.
 
 ## Scope of each record
 
