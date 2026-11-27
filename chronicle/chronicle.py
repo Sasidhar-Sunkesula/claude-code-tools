@@ -10,7 +10,7 @@ compaction is blocked. Nothing is retried or repaired silently. docs/chronicle/n
 
 Commands:
   chronicle.py hook                      (Claude Code hooks: PostToolUse, UserPromptSubmit, Stop, PreCompact, SessionStart)
-  chronicle.py record TRANSCRIPT [--final] [--start-segments N] [--from ISO_TIME]
+  chronicle.py record TRANSCRIPT [--final] [--start-segments N] [--from ISO_TIME] [--effort LEVEL]
   chronicle.py rebuild PROJECT_DIR       (rewrite now.md from the records)
   chronicle.py import-log PROJECT_DIR LOG.md [--dry]   (an old lab log's entries before the first transcript record,
                                          copied verbatim as records, one per stretch between wakings and per day)
@@ -49,6 +49,7 @@ SKIP_ATTACH = {"output_style", "deferred_tools_record", "deferred_tools_delta", 
                "credential_org", "remote_session_change", "silent_turn_reminder", "todo_reminder", "mode"}
 CHARS_PER_TOKEN = 3.3
 MAX_PARTS = [10 ** 9]  # record at most this many parts in one run (--max-parts)
+OVERRIDE = {}  # config values given on the command line for one run (record --effort)
 
 
 # ---------------------------------------------------------------- basics
@@ -82,6 +83,7 @@ class Project:
             cfg.update(json.load(open(os.path.join(root, ".claude", "chronicle.json"), encoding="utf-8")))
         except Exception:
             pass
+        cfg.update(OVERRIDE)
         self.cfg = cfg
         self.rec_dir = os.path.join(root, cfg["records_dir"])
         self.st_dir = os.path.join(root, cfg["state_dir"])
@@ -1215,6 +1217,8 @@ def main():
         proj = a[a.index("--project") + 1] if "--project" in a else None
         if "--max-parts" in a:
             MAX_PARTS[0] = int(a[a.index("--max-parts") + 1])
+        if "--effort" in a:  # this run only; the project's config stays as it is
+            OVERRIDE["effort"] = a[a.index("--effort") + 1]
         frm = a[a.index("--from") + 1] if "--from" in a else None
         return record(a[1], final, n, proj, frm)
     if a[0] == "import-log":
