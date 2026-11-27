@@ -1102,9 +1102,39 @@ def hook():
         return hook_error(ev, "".join(traceback.format_exception(ex))[-1500:])
 
 
+def resumed_from():
+    """The session id the running Claude Code process was started with (--resume ID), read from this hook's
+    ancestor processes, or None."""
+    pid = os.getpid()
+    for _ in range(6):
+        try:
+            if os.name == "nt":
+                out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                      f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; "
+                                      f"\"$($p.ParentProcessId)`t$($p.CommandLine)\""],
+                                     capture_output=True, text=True, timeout=20).stdout.strip()
+                ppid, _, cmd = out.partition("\t")
+            else:
+                ppid = open(f"/proc/{pid}/stat").read().split(")")[-1].split()[1]
+                cmd = open(f"/proc/{pid}/cmdline").read().replace("\0", " ")
+        except Exception:
+            return None
+        m = re.search(r"--resume[= ]\"?([0-9a-f-]{36})", cmd or "")
+        if m and "claude" in cmd.lower():
+            return m.group(1)
+        if not ppid.strip().isdigit() or int(ppid) in (0, pid):
+            return None
+        pid = int(ppid)
+    return None
+
+
 def previous_transcript(sid, folder):
-    """The newest existing transcript among the earlier ids of a desktop-app session (its record in the app's
-    claude-code-sessions folder lists them), or None."""
+    """The transcript a session continued from when its own file is not written yet: the one its Claude Code
+    process was started to resume, else the newest existing one among the earlier ids in the desktop app's record of
+    the chat, or None."""
+    r = resumed_from()
+    if r and os.path.isfile(os.path.join(folder, r + ".jsonl")):
+        return os.path.join(folder, r + ".jsonl")
     base = os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code-sessions")
     for rec in glob.glob(os.path.join(base, "*", "*", "local_*.json")):
         try:
@@ -1134,15 +1164,15 @@ def _hook(inp, ev):
         return 0
     pj = Project(root)
     transcript = inp.get("transcript_path") or ""
-    if ev == "PreCompact" and transcript and not os.path.isfile(transcript):
+    if transcript and not os.path.isfile(transcript):
         # the desktop app continues a session into a new transcript (a new session id) and writes that file only
         # after the hooks have run: the work so far is in the session's previous transcript, which the app's own
         # record of the chat names
         prev = previous_transcript(inp.get("session_id", ""), os.path.dirname(transcript))
         if prev:
             pj_log = Project(root)
-            pj_log.log(f"PreCompact: {os.path.basename(transcript)} is not written yet; recording from the session's "
-                       f"previous transcript {os.path.basename(prev)}")
+            pj_log.log(f"{ev}: {os.path.basename(transcript)} is not written yet; using the session's previous "
+                       f"transcript {os.path.basename(prev)}")
             transcript = prev
     if not transcript or not os.path.isfile(transcript):
         if ev == "PreCompact":
