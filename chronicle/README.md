@@ -11,8 +11,10 @@ those records, not just the summary.
 ## How it works
 
 1. **While the session works.** A `PostToolUse` / `UserPromptSubmit` / `Stop` hook counts new transcript tokens. The
-   count reads only the bytes added since the last check, so it takes milliseconds. Every `chunk_tokens` (default 250k),
-   the hook starts a detached recorder, which writes the new work as one record per `part_tokens` (default 250k).
+   count reads only the bytes added since the last check, so it takes milliseconds. Every `chunk_tokens` (default
+   500k), the hook starts a detached recorder, which writes the new work as one record per `part_tokens` (default
+   500k): about two summarizer calls per 1M of transcript. A whole 1M can't be one call: the summarizer's window is
+   1M too, and real token counts run about 15% above the estimate.
 2. **The recorder** walks the session's main line, following compaction boundaries, from the last recorded entry. It
    renders the new part in order and sends it in one call to `claude -p --model claude-opus-5-5 --effort xhigh`:
    - every user message, message to the user, tool call with its full input, and tool result with full text and every image;
