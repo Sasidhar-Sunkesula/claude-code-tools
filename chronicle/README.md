@@ -12,9 +12,7 @@ those records, not just the summary.
 
 1. **While the session works.** A `PostToolUse` / `UserPromptSubmit` / `Stop` hook counts new transcript tokens. The
    count reads only the bytes added since the last check, so it takes milliseconds. Every `chunk_tokens` (default 250k),
-   the hook starts a detached recorder. It writes the new work as records of `part_tokens` (default 125k) each: one
-   summarizer call per record, because its output (about half its input, thinking included) must stay under the
-   model's 128k output cap.
+   the hook starts a detached recorder, which writes the new work as one record per `part_tokens` (default 250k).
 2. **The recorder** walks the session's main line, following compaction boundaries, from the last recorded entry. It
    renders the new part in order and sends it in one call to `claude -p --model claude-opus-5-5 --effort xhigh`:
    - every user message, message to the user, tool call with its full input, and tool result with full text and every image;
@@ -23,13 +21,14 @@ those records, not just the summary.
    already recorded is sent as a pointer to the record that holds it; on a waking re-read of unchanged docs, that removes
    most of the pages. Continuity context goes in as well: the previous records of the same segment, or the previous
    record plus the compaction summary at a segment's start.
-3. **The record** (`docs/chronicle/sessions/<date>_<time>.md`) has three sections:
-   - **Timeline**: every event in strict order.
-   - **State at the end**: the task, the next step, running jobs, uncommitted files, open questions, promises.
-   - **Carry forward**: instructions in force, decisions with reasons, numbers, dead ends.
-   User messages, the assistant's messages to the user and written acts are inserted **verbatim by the program** at
-   the model's `{{T#}}` / `{{R#}}` / `{{A#}}` placeholders, so they can't be paraphrased. A record whose placeholders
-   are missing, repeated, unknown or out of order is rejected, never repaired.
+3. **The record** (`docs/chronicle/sessions/<date>_<time>.md`) is a short timeline. User messages, the assistant's
+   messages to the user and written acts are inserted **verbatim by the program** at the model's `{{T#}}` / `{{R#}}` /
+   `{{A#}}` placeholders, so they can't be paraphrased. Between them, the model writes short notes only for what those
+   texts don't already say: results it didn't report, files changed, decisions and reasons, dead ends, errors, jobs
+   still running. Its own text has a target, not a limit, of `words_per_1k` words per 1k transcript tokens (default 5:
+   about 5k words, or 7k tokens, per 1M), and the log and the record's header show what it used. With the verbatim
+   texts, a 1M stretch comes to roughly 15–20k tokens. A record whose placeholders are missing, repeated, unknown or out of order is
+   rejected, never repaired.
 4. **Before a compaction**, the `PreCompact` hook records everything not yet recorded, and the compaction waits for
    it. If the record can't be completed, the hook exits with code 2, which blocks the compaction, and Claude Code
    shows the reason. That happens when:
@@ -43,7 +42,7 @@ those records, not just the summary.
    shown to the user once, and the next compaction goes ahead only if everything up to it can be recorded then.
 5. **`now.md`** is rebuilt after every record, within `budget_tokens`:
    - the most recent records in full (up to `full_tokens`);
-   - earlier records of the last `days` as their user messages (verbatim) plus their carried-forward lists;
+   - earlier records of the last `days` as their user messages and acts (verbatim);
    - an index of every record.
    It reaches the session in one of two ways:
    - `inject: "import"`: the project's CLAUDE.md has `@docs/chronicle/now.md`. It is re-read on every compaction and
@@ -63,7 +62,7 @@ the program inserts the text verbatim, exactly as it does user messages. So acts
 ## Scope of each record
 
 Records are read one after another, so each one covers only its own part. The prompt forbids restating CONTEXT
-(earlier records, the compaction summary) in any section; Carry forward lists only what that part added or changed.
+(earlier records, the compaction summary).
 The session's reads of its own chronicle (its page images, or records rendered through textimg) are replaced in the
 input by a one-line marker, so memory is never re-summarized into memory.
 
