@@ -11,8 +11,10 @@ those records, not just the summary.
 ## How it works
 
 1. **While the session works.** A `PostToolUse` / `UserPromptSubmit` / `Stop` hook counts new transcript tokens. The
-   count reads only the bytes added since the last check, so it takes milliseconds. Every `chunk_tokens` (default 120k),
-   the hook starts a detached recorder.
+   count reads only the bytes added since the last check, so it takes milliseconds. Every `chunk_tokens` (default 250k),
+   the hook starts a detached recorder. It writes the new work as records of `part_tokens` (default 125k) each: one
+   summarizer call per record, because its output (about half its input, thinking included) must stay under the
+   model's 128k output cap.
 2. **The recorder** walks the session's main line, following compaction boundaries, from the last recorded entry. It
    renders the new part in order and sends it in one call to `claude -p --model claude-opus-5-5 --effort xhigh`:
    - every user message, message to the user, tool call with its full input, and tool result with full text and every image;
@@ -21,15 +23,24 @@ those records, not just the summary.
    already recorded is sent as a pointer to the record that holds it; on a waking re-read of unchanged docs, that removes
    most of the pages. Continuity context goes in as well: the previous records of the same segment, or the previous
    record plus the compaction summary at a segment's start.
-3. **The record** (`docs/chronicle/<date>_<time>.md`) has three sections:
+3. **The record** (`docs/chronicle/sessions/<date>_<time>.md`) has three sections:
    - **Timeline**: every event in strict order.
    - **State at the end**: the task, the next step, running jobs, uncommitted files, open questions, promises.
    - **Carry forward**: instructions in force, decisions with reasons, numbers, dead ends.
-   User messages and the assistant's messages to the user are inserted **verbatim by the program** at the model's
-   `{{T#}}` / `{{R#}}` placeholders, so they can't be paraphrased; any the model skips are inserted anyway.
-4. **Before a compaction**, the `PreCompact` hook starts recording the remaining tail. By default it doesn't wait
-   (`precompact_wait` 0 s): a tail takes 2–8 minutes to record, too long to hold a compaction for. The tail finishes
-   in the background, and the next tool call or message tells the session to read it.
+   User messages, the assistant's messages to the user and written acts are inserted **verbatim by the program** at
+   the model's `{{T#}}` / `{{R#}}` / `{{A#}}` placeholders, so they can't be paraphrased. A record whose placeholders
+   are missing, repeated, unknown or out of order is rejected, never repaired.
+4. **Before a compaction**, the `PreCompact` hook records everything not yet recorded, and the compaction waits for
+   it. If the record can't be completed, the hook exits with code 2, which blocks the compaction, and Claude Code
+   shows the reason. That happens when:
+   - the summarizer fails: an error, a refusal, output cut at the token cap, or no answer within an hour;
+   - the record is malformed (see above);
+   - the last recorded entry is no longer on the transcript's line (rewound or edited). Where to go on is not guessed:
+     the message gives the command, `record TRANSCRIPT --final --project DIR --from <time>`;
+   - `precompact_timeout` (default 55 min) passes. The recorder keeps running, and the next `/compact` waits for it.
+   The PreCompact hook's own timeout in settings must be longer than `precompact_timeout`, because a hook that times
+   out lets the compaction run. Nothing is retried or repaired silently. A recording that fails in the background is
+   shown to the user once, and the next compaction goes ahead only if everything up to it can be recorded then.
 5. **`now.md`** is rebuilt after every record, within `budget_tokens`:
    - the most recent records in full (up to `full_tokens`);
    - earlier records of the last `days` as their user messages (verbatim) plus their carried-forward lists;
@@ -37,9 +48,9 @@ those records, not just the summary.
    It reaches the session in one of two ways:
    - `inject: "import"`: the project's CLAUDE.md has `@docs/chronicle/now.md`. It is re-read on every compaction and
      start, so it can't be skipped.
-   - `inject: "images"`: `now.md` is rendered by textimg into `docs/chronicle/pages/`, at about half the tokens. The
-     `SessionStart` hook names the pages and tells the session to read them all first. Exact text can still be grepped
-     from the records.
+   - `inject: "images"`: after a compaction (or `/clear`), the `SessionStart` hook tells the session to render
+     `now.md` with textimg, at about half the tokens, and read every page first. Not on a resume: a resumed session
+     still holds its whole context. Exact text can still be grepped from the records.
 
 ## Written acts, verbatim
 
@@ -48,21 +59,6 @@ these are written through `bench/act.sh`, which prints the act whole between `AC
 that printout out of the tool result and labels it `[A#]`. The summarizer places `{{A#}}` where the act happened, and
 the program inserts the text verbatim, exactly as it does user messages. So acts need no files of their own. In
 `now.md`, an older record's condensed form keeps its acts along with the user's messages.
-
-## The chat's own summary at each compaction
-
-The summarizer can't see the working model's thinking. So at `PreCompact` the hook also copies the transcript as it
-stands and starts `chronicle.py forksum`. That job runs a `claude -p --resume <copy> --fork-session` with the chat's
-own model, one turn, no tools and all hooks off (`disableAllHooks`, `CHRONICLE_OFF`), in the project folder. Because the
-prefix is identical, the fork reads the session's whole context from cache, thinking included. It is asked only for a
-summary of the stretch since the last compaction: requests, what was done and found, decisions and why, approaches set
-aside. The answer is saved verbatim as `sessions/<date>_<time>_own-summary.md`, and the copy and the fork are deleted.
-In a test on a 605k-token context, it read 605,651 tokens from cache and wrote a 13k-character summary.
-
-If the session compacted because its context window was full ("Prompt is too long"), the fork can't fit either. The
-copy is then cut back to the last of the chat's turns that is at least 60k tokens smaller, and the fork runs again.
-The record says where it stops, and the work after that point is covered by the separate model's records. An
-error message is never saved as a summary.
 
 ## Scope of each record
 
@@ -100,7 +96,7 @@ The mind project's docs/log.md (1,811 entries) became 74 such records, plus 4 in
   "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 30}]}],
   "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 30}]}],
   "Stop": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 30}]}],
-  "PreCompact": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 1600}]}],
+  "PreCompact": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 3600}]}],
   "SessionStart": [{"hooks": [{"type": "command", "command": "python /path/to/claude-code-tools/chronicle/chronicle.py hook", "timeout": 60}]}]
 }
 ```
@@ -108,7 +104,8 @@ The mind project's docs/log.md (1,811 entries) became 74 such records, plus 4 in
 - **Backfill**, run from the project: `python chronicle.py record TRANSCRIPT --final --start-segments N --project .`
   records the last N segments in order.
 - **Status**: `python chronicle.py status PROJECT`.
-- **Logs**: `docs/chronicle/log.txt` and `job.log`. State: `state.json` (recorder) and `hook.json` (hooks), beside the records and kept out of git.
+- **Logs**: `log.txt` and `job.log` in `state_dir` (default `docs/chronicle/.tool/`). State there too: `state.json`
+  (recorder) and `hook.json` (hooks). Keep it out of git.
 
 ## Limits found in testing
 

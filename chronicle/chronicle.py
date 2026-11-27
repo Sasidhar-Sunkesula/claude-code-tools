@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """chronicle: a separate model's full-fidelity record of a long Claude Code session, part by part.
 
-While the session works, every ~chunk_tokens of new transcript is handed (complete: thinking, every tool call and
-result, every image) to a separate summarizer (claude -p, Opus 5.5, xhigh effort), which writes a chronological
-record. User messages and the assistant's messages to the user are inserted verbatim by this program, never by the
-model. Before each compaction the remaining tail is recorded too. docs/chronicle/now.md, imported by the project's
-CLAUDE.md, is rebuilt after every record, so after a compaction the session wakes with the records loaded.
+While the session works, every ~chunk_tokens of new transcript starts a background recording: the new part (every
+message, tool call and result, every image; not the thinking) goes to a separate summarizer (claude -p, Opus 5.5,
+xhigh effort) in records of part_tokens each. User messages, the assistant's messages to the user and written acts are
+inserted verbatim by this program, never by the model. Before each compaction everything not yet recorded is recorded
+and the compaction waits for it; if the record cannot be completed (any failure, or precompact_timeout), the
+compaction is blocked. Nothing is retried or repaired silently. docs/chronicle/now.md is rebuilt after every record.
 
 Commands:
   chronicle.py hook                      (Claude Code hooks: PostToolUse, UserPromptSubmit, Stop, PreCompact, SessionStart)
-  chronicle.py record TRANSCRIPT [--final] [--start-segments N]
+  chronicle.py record TRANSCRIPT [--final] [--start-segments N] [--from ISO_TIME]
   chronicle.py rebuild PROJECT_DIR       (rewrite now.md from the records)
   chronicle.py import-log PROJECT_DIR LOG.md [--dry]   (an old lab log's entries before the first transcript record,
                                          copied verbatim as records, one per stretch between wakings and per day)
@@ -23,14 +24,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {
     "title_match": "",            # record only sessions whose title contains this (case-insensitive); "" = any
     "min_context": 150000,        # ...and only once their context has grown past this many tokens
-    "chunk_tokens": 120000,       # transcript tokens per recorded part
+    "chunk_tokens": 250000,       # new transcript tokens that start a background recording
+    "part_tokens": 125000,        # transcript tokens per record: one summarizer call, whose output (about half its
+                                  # input, thinking included) must stay under the model's 128k output cap
     "model": "claude-opus-5-5",
     "effort": "xhigh",
     "max_output_tokens": 128000,
     "budget_tokens": 150000,      # size of now.md
     "full_tokens": 110000,        # of which: the most recent records in full
     "days": 7,                    # older records appear in now.md's index only
-    "precompact_wait": 0,         # seconds PreCompact waits for the tail's record (a record takes 2-8 min: not worth holding a compaction)
+    "precompact_timeout": 3300,   # seconds PreCompact waits for the record before it blocks the compaction; keep it
+                                  # below the PreCompact hook's own timeout (a hook that times out lets compaction run)
     "records_dir": "docs/chronicle",
     "state_dir": "docs/chronicle/.tool",
     "claude": "",                 # path of the claude CLI ("" = from PATH)
@@ -164,14 +168,14 @@ def drop_lock(pj):
 
 
 def spawn(args, pj):
-    """Start a detached background process (it outlives the hook)."""
+    """Start a detached background process (it outlives the hook); returns its Popen."""
     out = open(os.path.join(pj.st_dir, "job.log"), "a", encoding="utf-8")
     kw = dict(stdin=subprocess.DEVNULL, stdout=out, stderr=out, close_fds=True, cwd=pj.root)
     if os.name == "nt":
         kw["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
     else:
         kw["start_new_session"] = True
-    return subprocess.Popen([sys.executable, os.path.abspath(__file__)] + args, **kw).pid
+    return subprocess.Popen([sys.executable, os.path.abspath(__file__)] + args, **kw)
 
 
 # ---------------------------------------------------------------- transcript
@@ -491,32 +495,32 @@ def summarize(pj, blocks, tag):
     args = [claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--model", cfg["model"], "--effort", cfg["effort"], "--setting-sources", "", "--tools", "",
             "--strict-mcp-config", "--system-prompt-file", os.path.join(HERE, "prompt.md"), "--no-session-persistence"]
-    last_err = ""
-    for attempt in range(3):
-        t0 = time.time()
-        try:
-            r = subprocess.run(args, input=msg + "\n", capture_output=True, text=True, encoding="utf-8",
-                               env=env, cwd=work, timeout=3600)
-        except subprocess.TimeoutExpired:
-            last_err = "timeout"
-            continue
-        res = None
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if d.get("type") == "result":
-                    res = d
-        if res and not res.get("is_error") and (res.get("result") or "").strip():
-            pj.log(f"{tag}: summarized in {time.time() - t0:.0f}s, usage {json.dumps(res.get('usage', {}))[:300]}")
-            return res["result"]
-        last_err = (json.dumps(res)[:600] if res else (r.stderr or r.stdout)[-600:])
-        pj.log(f"{tag}: attempt {attempt + 1} failed: {last_err}")
-        time.sleep(20 * (attempt + 1))
-    raise RuntimeError(f"summarizer failed: {last_err}")
+    # one attempt: any failure (an error, a refusal, output cut at the token cap, a timeout) is raised, never retried
+    t0 = time.time()
+    try:
+        r = subprocess.run(args, input=msg + "\n", capture_output=True, text=True, encoding="utf-8",
+                           env=env, cwd=work, timeout=3600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("the summarizer did not finish within an hour")
+    res = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("type") == "result":
+                res = d
+    if not res:
+        raise RuntimeError(f"the summarizer gave no result (exit {r.returncode}): {(r.stderr or r.stdout)[-600:]}")
+    stop = res.get("stop_reason")
+    if res.get("is_error") or res.get("subtype") != "success" or stop not in (None, "end_turn") \
+            or not (res.get("result") or "").strip():
+        raise RuntimeError(f"the summarizer failed (subtype {res.get('subtype')}, stop_reason {stop}): "
+                           f"{json.dumps(res, ensure_ascii=False)[:600]}")
+    pj.log(f"{tag}: summarized in {time.time() - t0:.0f}s, usage {json.dumps(res.get('usage', {}))[:300]}")
+    return res["result"]
 
 
 # ---------------------------------------------------------------- record assembly
@@ -525,14 +529,25 @@ def quote(s):
 
 
 def assemble(raw, items, labels, header):
-    """Insert verbatim user messages and replies at the model's placeholders; repair missing ones."""
+    """Insert verbatim user messages, replies and acts at the model's placeholders. A record that is malformed (no
+    Timeline; a placeholder missing, repeated, unknown or out of order) is an error, never repaired."""
     s = raw.strip()
     s = re.sub(r"^```(?:markdown|md)?\s*\n", "", s)
     s = re.sub(r"\n```\s*$", "", s)
     i = s.find("## Timeline")
-    s = s[i:] if i >= 0 else "## Timeline\n" + s
+    if i < 0:
+        raise RuntimeError("the summarizer's record has no '## Timeline' section")
+    s = s[i:]
     seq = [labels[i] for i in range(len(items)) if labels[i]]
     body = {labels[i]: (i, items[i]) for i in range(len(items)) if labels[i]}
+    pat = re.compile(r"\{\{([TRA]\d+)\}\}")
+    got = [m.group(1) for ln in s.split("\n") for m in [pat.fullmatch(ln.strip())] if m]
+    if got != seq:
+        missing = [x for x in seq if x not in got]
+        extra = [x for x in got if x not in body or got.count(x) > 1]
+        raise RuntimeError(f"the summarizer's placeholders do not match the part's messages in order: missing "
+                           f"{missing[:20]}, unknown or repeated {extra[:20]}"
+                           + ("" if missing or extra else ", out of order"))
 
     def verbatim(lab):
         i, (k, ts, p) = body[lab]
@@ -546,59 +561,59 @@ def assemble(raw, items, labels, header):
             return f"**[{lab}] Act · {when}**\n{quote(p)}"
         return f"**[{lab}] Assistant to the user · {when}**\n{quote(p)}"
 
-    lines = s.split("\n")
-    placed, out = set(), []
-    pat = re.compile(r"\{\{([TRA]\d+)\}\}")
-    for ln in lines:
+    out = []
+    for ln in s.split("\n"):
         m = pat.fullmatch(ln.strip())
         if m:
-            lab = m.group(1)
-            if lab in body and lab not in placed:
-                # anything earlier in the sequence that the model skipped goes in first, in order
-                for prev in seq[:seq.index(lab)]:
-                    if prev not in placed:
-                        out.append(verbatim(prev) + "\n\n*(placed by the program: the summarizer omitted it)*")
-                        placed.add(prev)
-                out.append(verbatim(lab))
-                placed.add(lab)
-            continue
-        out.append(pat.sub(lambda mm: f"[{mm.group(1)}]", ln))
-    missing = [lab for lab in seq if lab not in placed]
-    if missing:
-        j = next((n for n, ln in enumerate(out) if ln.startswith("## State at the end")), len(out))
-        add = [verbatim(lab) + "\n\n*(placed by the program: the summarizer omitted it)*" for lab in missing]
-        out[j:j] = add + [""]
+            out.append(verbatim(m.group(1)))
+        else:
+            out.append(pat.sub(lambda mm: f"[{mm.group(1)}]", ln))  # a mention inside a sentence stays a reference
     return header + "\n" + "\n".join(out).rstrip() + "\n"
 
 
 # ---------------------------------------------------------------- recording
-def record(transcript, final=False, start_segments=1, project=None):
+def record(transcript, final=False, start_segments=1, project=None, from_ts=None):
     root = find_root(project or os.getcwd())
     if not root:
         print("chronicle: no .claude/chronicle.json above the project directory", file=sys.stderr)
         return 1
     pj = Project(root)
-    if not take_lock(pj, 3600 if final else 5):
-        pj.log("record: another recorder holds the lock; exiting")
-        return 0
+    if not take_lock(pj, pj.cfg["precompact_timeout"] if final else 5):
+        if not final:  # a recording is already running: it does this job
+            pj.log("record: another recorder holds the lock; exiting")
+            return 0
+        fail_state(pj, "the lock stayed held by another recorder for the whole wait")
+        return 1
     try:
-        rc = _record(pj, transcript, final, start_segments)
-        if final:
-            finish_final(pj)
+        rc = _record(pj, transcript, final, start_segments, from_ts)
+        st = pj.load()
+        if st.pop("failure", None):
+            pj.save(st)
         return rc
     except Exception as ex:
         import traceback
         pj.log("record failed: " + "".join(traceback.format_exception(ex))[-3000:])
+        fail_state(pj, str(ex))
         return 1
     finally:
         drop_lock(pj)
 
 
-def _record(pj, transcript, final, start_segments):
+def fail_state(pj, err):
+    """A failed recording is kept in the state until a recording succeeds; the hooks show it to the user."""
+    pj.log("record failed: " + err[:1500])
+    st = pj.load()
+    st["failure"] = {"at": now_iso(), "error": err[:1500]}
+    pj.save(st)
+
+
+def _record(pj, transcript, final, start_segments, from_ts=None):
     st = pj.load()
     idx, order, title = index_file(transcript)
     chain = main_chain(idx, order)
     if not chain:
+        if final:
+            raise RuntimeError(f"no conversation entries found in {transcript}")
         return 0
     # Results of parallel tool calls hang off their call's entry as side branches; the model saw them, so they are
     # taken in (only tool results: a rewound branch's messages are not). Everything is ordered by file position.
@@ -606,14 +621,20 @@ def _record(pj, transcript, final, start_segments):
     on = set(chain)
     side = {u for u in order if u not in on and idx[u][2] == "user" and idx[u][3] in on and not idx[u][5]}
     last = st.get("last_uuid")
-    if last in fpos and (last in on or last in side):
+    if from_ts:  # a restart point the user chose: every entry on the current line after that time
+        lp = max([fpos[u] for u in on | side if (idx[u][7] or "") <= from_ts] or [-1])
+        pj.log(f"record: starting after {from_ts}, as asked")
+    elif last in fpos and (last in on or last in side):
         lp = fpos[last]
-    else:
+    elif last:
+        end = (st.get("records") or [{}])[-1].get("end", "?")
+        raise RuntimeError(
+            f"the last recorded entry ({last}) is not on this transcript's current line: the transcript was rewound, "
+            f"edited or replaced, so where to go on is not guessed. The last record ends at {end}. To go on, record "
+            f"from a time you choose: python \"{os.path.abspath(__file__)}\" record \"{transcript}\" --final "
+            f"--project \"{pj.root}\" --from {end}")
+    else:  # the first recording of this project: the last start_segments segments
         bounds = [i for i, u in enumerate(chain) if idx[u][6] == "compact_boundary"]
-        if last:
-            pj.log(f"record: last recorded entry {last} is not on the current line (rewind or new file); "
-                   f"starting at the latest compaction")
-            start_segments = 1
         start = bounds[-start_segments] if len(bounds) >= start_segments else 0
         lp = fpos[chain[start]] - 1
     todo = sorted((u for u in on | side if fpos[u] > lp), key=fpos.get)
@@ -653,13 +674,13 @@ def _record(pj, transcript, final, start_segments):
             tok += sum(est(x) for x in its)
             nxt = units[k + 1][1] if k + 1 < len(units) else []
             ends_with_call = any(x[0] == "call" for x in its) and not any(x[0] == "result" for x in its)
-            if tok >= pj.cfg["chunk_tokens"] and not ends_with_call and not (nxt and nxt[0][0] == "result"):
+            if tok >= pj.cfg["part_tokens"] and not ends_with_call and not (nxt and nxt[0][0] == "result"):
                 parts.append(cur)
                 cur, tok = [], 0
         if cur:
             if final or closed:
                 parts.append(cur)
-            elif sum(sum(est(x) for x in its) for _, its in cur) >= pj.cfg["chunk_tokens"]:
+            elif sum(sum(est(x) for x in its) for _, its in cur) >= pj.cfg["part_tokens"]:
                 parts.append(cur)
         for part in parts:
             if MAX_PARTS[0] <= 0:
@@ -675,190 +696,6 @@ def _record(pj, transcript, final, start_segments):
             pj.save(st)
             rebuild(pj)
     return 0
-
-
-FORK_PROMPT = ("Write a summary of this conversation's work since the last compaction only; everything before that "
-               "compaction is already recorded elsewhere. Cover: the user's requests in this stretch; what was done and "
-               "found, with exact numbers, files and commands; the decisions made and why; the approaches considered and "
-               "set aside. Record only what happened: no next steps, plans, open questions or to-do lists. Do not use "
-               "any tools. Output only the summary.")
-
-
-def forksum_snapshot(pj, transcript):
-    """A copy of the transcript under a new session id, beside it (taken before the compaction changes anything)."""
-    import uuid
-    cid = str(uuid.uuid4())
-    shutil.copyfile(transcript, os.path.join(os.path.dirname(transcript), cid + ".jsonl"))
-    return cid
-
-
-FORK_MARGINS = (20_000, 60_000, 150_000)  # tokens the fork's copy is cut back by, in turn, when the session had filled its context window
-
-
-def fork_turns(path):
-    """Where each of the chat's own API responses starts in a transcript (byte offset, the context it was sent with,
-    its time), and the offset of the last compaction boundary."""
-    turns, seen, boundary, off = [], set(), 0, 0
-    with open(path, "rb") as fh:
-        for raw in fh:
-            # anywhere in the line: newer transcripts put the message before "type" in assistant entries
-            if b'"compact_boundary"' in raw or b'"type":"assistant"' in raw:
-                try:
-                    d = json.loads(raw)
-                except Exception:
-                    d = {}
-                if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
-                    boundary = off
-                elif d.get("type") == "assistant":
-                    m = d.get("message") or {}
-                    u = m.get("usage") or {}
-                    if u and m.get("id") not in seen and str(m.get("model", "")).startswith("claude"):
-                        seen.add(m.get("id"))
-                        turns.append((off, u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-                                      + u.get("cache_read_input_tokens", 0), d.get("timestamp", "")))
-            off += len(raw)
-    return turns, boundary
-
-
-def forksum(transcript, cid, project=None):
-    """The chat's own model, in a fork of the copied session (its full context, from cache), writes a summary of the
-    stretch since the last compaction; it is saved verbatim as a record and the copy and the fork are removed."""
-    root = find_root(project or os.getcwd())
-    if not root:
-        return 1
-    pj = Project(root)
-    folder = os.path.dirname(transcript)
-    copy = os.path.join(folder, cid + ".jsonl")
-    made = [copy, os.path.join(folder, cid)]
-    model, upto, cut, text = None, "", None, ""
-    try:
-        size = os.path.getsize(copy)
-        with open(copy, "rb") as fh:
-            fh.seek(max(0, size - 30_000_000))
-            for raw in fh:
-                if b'"type":"assistant"' in raw:
-                    try:
-                        d = json.loads(raw)
-                        m = d["message"].get("model") or ""
-                        if d.get("type") == "assistant" and m.startswith("claude"):  # not a "<synthetic>" error message
-                            model, upto = m, d.get("timestamp") or upto
-                    except Exception:
-                        pass
-        claude = pj.cfg["claude"] or shutil.which("claude") or "claude"
-        env = dict(os.environ, CHRONICLE_OFF="1")
-        args = [claude, "-p", FORK_PROMPT, "--resume", cid, "--fork-session", "--permission-mode", "dontAsk",
-                "--max-turns", "1", "--output-format", "json", "--settings", json.dumps({"disableAllHooks": True})]
-        if model:
-            args += ["--model", model]
-
-        def run():
-            r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", env=env, cwd=root,
-                               stdin=subprocess.DEVNULL, timeout=3600)
-            res = {}
-            for line in reversed(r.stdout.strip().splitlines()):
-                try:
-                    res = json.loads(line)
-                    break
-                except Exception:
-                    continue
-            fork = res.get("session_id")
-            if fork:
-                made.extend([os.path.join(folder, fork + ".jsonl"), os.path.join(folder, fork)])
-            out = (res.get("result") or "").strip()
-            if len(out) <= 200 and fork and os.path.exists(os.path.join(folder, fork + ".jsonl")):
-                # the summary is the fork's first message after our prompt (a hook or the turn limit may end the run later)
-                seen_prompt = False
-                for line in open(os.path.join(folder, fork + ".jsonl"), encoding="utf-8"):
-                    d = json.loads(line)
-                    if d.get("type") == "user" and d.get("message", {}).get("content") == FORK_PROMPT:
-                        seen_prompt = True
-                    elif seen_prompt and d.get("type") == "assistant":
-                        t = "".join(b.get("text", "") for b in d["message"]["content"] if b.get("type") == "text").strip()
-                        if len(t) > 200:
-                            out = t
-                            break
-            return r, res, out
-
-        if not model:
-            pj.log("forksum: the chat's model was not found in the transcript; no summary (another model would not "
-                   "share the session's cache)")
-            return 1
-        t0 = time.time()
-        r, res, text = run()
-        if "prompt is too long" in text.lower():
-            # the session had filled its context window (it compacted because it ran out): the copy is cut back to the
-            # last of its turns that fits, a little further each try; the work after the cut is in the separate model's
-            # records. A turn that recent is still in the session's cache.
-            turns, boundary = fork_turns(copy)
-            turns = [t for t in turns if t[0] > boundary]
-            for margin in FORK_MARGINS:
-                fit = [t for t in turns if t[1] <= turns[-1][1] - margin]
-                if not fit:
-                    break
-                cut = fit[-1]
-                with open(copy, "r+b") as fh:
-                    fh.truncate(cut[0])
-                pj.log(f"forksum: the context was full ({turns[-1][1]} tokens); retrying on the copy cut back to "
-                       f"{local(cut[2])} ({cut[1]} tokens)")
-                r, res, text = run()
-                if "prompt is too long" not in text.lower():
-                    break
-        u = res.get("usage", {})
-        pj.log(f"forksum: {model} in {time.time() - t0:.0f}s, cache read {u.get('cache_read_input_tokens')}, "
-               f"written {u.get('cache_creation_input_tokens')}, out {u.get('output_tokens')}, summary {len(text)} chars")
-        if len(text) <= 200 or res.get("is_error"):
-            pj.log("forksum: no summary came back: " + (text or r.stderr or r.stdout)[-400:])
-            text = ""
-    finally:
-        for p in made:  # removed before any wait for the lock: the copy is as large as the session
-            try:
-                shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
-            except OSError:
-                pass
-    if not text:
-        return 1
-    if cut:
-        upto = cut[2]
-    upto = upto or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    name = f"sessions/{local(upto, '%Y-%m-%d_%H%M')}_own-summary.md"
-    body = (f"# The chat's own summary of its work up to {local(upto)}, written at the compaction\n"
-            f"- Written by {model}, the chat's own model, in a background copy of the session with its whole context; "
-            f"saved verbatim.\n"
-            + (f"- The session had filled its context window, so the copy was cut back to {local(upto)}; the work after "
-               f"that is in the separate model's records.\n" if cut else "")
-            + f"\n{text}\n")
-    if not take_lock(pj, 7200):
-        pj.log("forksum: the lock stayed held; the summary was not saved")
-        return 1
-    try:
-        os.makedirs(os.path.join(pj.rec_dir, "sessions"), exist_ok=True)
-        with open(os.path.join(pj.rec_dir, name), "w", encoding="utf-8", newline="\n") as f:
-            f.write(body)
-        st = pj.load()
-        st.setdefault("records", []).append({"file": name, "segment": "own-summary", "kind": "own-summary",
-                                             "start": upto, "end": upto, "tokens_in": 0, "chars": len(body),
-                                             "first_user": "the chat's own summary before the compaction"})
-        pj.save(st)
-        rebuild(pj)
-    finally:
-        drop_lock(pj)
-    return 0
-
-
-def finish_final(pj):
-    """The tail before a compaction is recorded: drop the 'not yet recorded' mark at once (now.md is rebuilt without it)
-    and queue the one-time pointer to the new record(s) for a session that read now.md before they existed."""
-    hs = pj.load_hook()
-    aw = hs.setdefault("notes", {}).pop("await", None)
-    hs.pop("pending", None)
-    if aw:
-        recs = pj.load().get("records", [])
-        files = [r["file"] for r in recs if r["end"][:19] > (aw.get("after") or "")[:19]
-                 and r["start"][:19] <= (aw.get("until") or "9")[:19]]
-        if files:
-            hs["notes"]["ready"] = {"files": files, "end": recs[-1]["end"], "told": []}
-    pj.save_hook(hs)
-    rebuild(pj)
 
 
 def write_part(pj, st, items, part, title):
@@ -1000,8 +837,6 @@ def condensed(text):
     if m:
         out.append("Carried forward:")
         out.append(m.group(1).strip())
-    if not out and text.startswith("# The chat's own summary"):
-        return text.split("\n\n", 1)[-1].strip()   # short already: kept whole
     if not out and text.startswith("# Chronicle (from the lab log)"):
         # a record copied from the lab log has no [T#] blocks or carried list: its entry headings stand for it
         out = ["Entries (headings; the full text is in the record):"] + [l for l in text.split("\n") if l.startswith("## ")]
@@ -1033,7 +868,6 @@ def rebuild(pj):
         used += tok(c)
     indexed = [r for r in recs if r not in full and r["file"] not in {c[0]["file"] for c in cond}]
     rel = cfg["records_dir"].replace("\\", "/")
-    pend = pj.load_hook().get("pending")
     out = ["# Session chronicle (generated by tools/chronicle; do not edit)", "",
            "These are records of this session's own transcript, written part by part by a separate model (Opus 5.5) "
            "from the complete raw transcript: every user message, reply, tool call and result. User messages and "
@@ -1053,9 +887,6 @@ def rebuild(pj):
             t = re.sub(r"^## ", "#### ", t, flags=re.M)
             out += ["", t.strip()]
         out.append("")
-    if pend:
-        out += [f"## Not yet recorded", "", f"The part from {local(pend.get('from', ''))} to the compaction is still being "
-                f"recorded; until then the compaction summary covers it.", ""]
     out.append("## Index of all records")
     for r in recs:
         out.append(f"- {local(r['start'])} → {local(r['end'], '%H:%M')} · {rel}/{r['file']} · {r.get('first_user') or '(continuing work)'}")
@@ -1230,90 +1061,94 @@ def scan_growth(st, transcript):
     return add, ctx
 
 
+GROWTH = ("PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop")
+
+
 def hook():
-    if os.environ.get("CHRONICLE_OFF"):  # a background copy of the session (the summary fork) is never recorded itself
-        return 0
+    """Claude Code hooks. PreCompact lets the compaction go ahead only once every part of the session up to it is
+    recorded; otherwise it blocks it (exit 2, the reason on stderr). Any other failure is shown to the user."""
+    raw = sys.stdin.buffer.read()
     try:
-        inp = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
-    except Exception:
-        return 0
+        inp = json.loads(raw.decode("utf-8") or "{}")
+    except Exception as ex:
+        return hook_error("PreCompact" if b"PreCompact" in raw else "", f"the hook's input could not be read: {ex}")
+    ev = inp.get("hook_event_name", "")
+    try:
+        return _hook(inp, ev)
+    except Exception as ex:
+        import traceback
+        return hook_error(ev, "".join(traceback.format_exception(ex))[-1500:])
+
+
+def hook_error(ev, msg):
+    if ev == "PreCompact":
+        sys.stderr.write("Chronicle blocked this compaction: " + msg)
+        return 2
+    sys.stdout.write(json.dumps({"systemMessage": "Chronicle hook error: " + msg}))
+    return 0
+
+
+def _hook(inp, ev):
     root = find_root(inp.get("cwd") or os.getcwd())
     if not root:
         return 0
     pj = Project(root)
-    ev = inp.get("hook_event_name", "")
     transcript = inp.get("transcript_path") or ""
-    sid = inp.get("session_id", "")
     if not transcript or not os.path.isfile(transcript):
+        if ev == "PreCompact":
+            raise RuntimeError(f"the session's transcript ({transcript or 'none given'}) cannot be read")
         return 0
     st = pj.load()  # recorder state: read only here
     hs = pj.load_hook()
     hs.setdefault("files", {}).setdefault(transcript, {})
-    hs.setdefault("notes", {})
     hs["has_records"] = bool(st.get("records"))
+    for old in ("notes", "pending"):  # keys of an earlier design
+        hs.pop(old, None)
     add = 0
-    if ev in ("PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop"):
+    if ev in GROWTH:
         add, _ = scan_growth(hs, transcript)
     if not tracked(pj, hs, transcript):
         pj.save_hook(hs)
         return 0
     f = hs["files"][transcript]
     out = None
-    if ev in ("PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop"):
+    if ev in GROWTH:
         f["pending"] = f.get("pending", 0) + add
         if f["pending"] >= pj.cfg["chunk_tokens"] and not os.path.exists(pj.lock_path):
-            pid = spawn(["record", transcript, "--project", pj.root], pj)
-            pj.log(f"hook {ev}: {f['pending']} new tokens; started recorder pid {pid}")
+            p = spawn(["record", transcript, "--project", pj.root], pj)
+            pj.log(f"hook {ev}: {f['pending']} new tokens; started recorder pid {p.pid}")
             f["pending"] = 0
-        # a record finished after the last compaction's context was built: point the session to it, once
-        note = hs["notes"].get("ready")
-        if note and ev in ("PostToolUse", "UserPromptSubmit") and sid not in note.get("told", []):
-            note.setdefault("told", []).append(sid)
-            files = note.get("files") or []
-            out = {"hookSpecificOutput": {"hookEventName": ev, "additionalContext":
-                   "Chronicle: the record(s) of the work just before the last compaction were finished after it: "
-                   + " ; ".join(f"{pj.cfg['records_dir']}/{x}" for x in files)
-                   + ". If the now.md you read after the compaction already held them (its index lists them), nothing is "
-                   "owed; otherwise read them in full now (textimg), before continuing: they are your memory of that work."}}
+        # a failed recording is shown to the user once; it stays in the state until a recording succeeds
+        fl = st.get("failure")
+        if fl and hs.get("failure_shown") != fl.get("at"):
+            hs["failure_shown"] = fl.get("at")
+            out = {"systemMessage": f"Chronicle: a recording failed at {local(fl.get('at', ''))}: "
+                                    f"{fl.get('error', '')[:600]} (log: {pj.cfg['state_dir']}/log.txt). The next "
+                                    f"compaction goes ahead only if everything up to it can be recorded then."}
     elif ev == "PreCompact":
-        before = len(st.get("records", []))
-        hs["pending"] = {"from": (st["records"][-1]["end"] if st.get("records") else ""), "since": now_iso()}
         f["pending"] = 0
         f["scan"] = os.path.getsize(transcript)
-        hs["notes"].pop("ready", None)
-        # another recording in progress (a part, or a backfill): never hold the compaction for it
-        busy = False
-        try:
-            busy = pid_alive(json.load(open(pj.lock_path, encoding="utf-8")).get("pid"))
-        except Exception:
-            pass
-        # the chat's own summary of this stretch: a copy of the transcript as it stands now, summarized in the background
-        # by the chat's own model in a fork of the session (its whole context, thinking included, read from cache)
-        try:
-            cid = forksum_snapshot(pj, transcript)
-            spawn(["forksum", transcript, cid, "--project", pj.root], pj)
-        except Exception as ex:
-            pj.log(f"PreCompact: the fork summary could not start: {ex}")
-        pid = spawn(["record", transcript, "--final", "--project", pj.root], pj)
-        # the pointer is queued before any wait, so a hook cut short still leaves it
-        hs["notes"]["await"] = {"pid": pid, "after": (st["records"][-1]["end"] if st.get("records") else ""),
-                                "until": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")}
         pj.save_hook(hs)
-        wait = 0 if busy else pj.cfg["precompact_wait"]
-        pj.log(f"PreCompact: started the final recorder (pid {pid}); waiting up to {wait}s"
-               + (" (another recording holds the lock)" if busy else ""))
-        t_end = time.time() + wait
-        while time.time() < t_end and pid_alive(pid):
+        limit = pj.cfg["precompact_timeout"]
+        t_end = time.time() + limit
+        p = spawn(["record", transcript, "--final", "--project", pj.root], pj)
+        pj.log(f"PreCompact: recording everything up to the compaction (pid {p.pid}); the compaction waits for it")
+        while p.poll() is None and time.time() < t_end:
             time.sleep(2)
-        hs = pj.load_hook()
-        if not pid_alive(pid):
-            hs.get("notes", {}).pop("await", None)
-            hs.pop("pending", None)
+        if p.poll() is None:
+            msg = (f"the record of the work before this compaction is not finished after "
+                   f"{f'{limit // 60} min' if limit >= 120 else f'{limit} s'}. The "
+                   f"recorder keeps running; compact again once it has ended ({pj.cfg['state_dir']}/log.txt).")
+        elif p.returncode != 0:
+            fl = pj.load().get("failure") or {}
+            msg = (f"recording failed: {fl.get('error') or 'exit code ' + str(p.returncode)} "
+                   f"({pj.cfg['state_dir']}/log.txt)")
         else:
-            pj.log("PreCompact: the tail is still being recorded; compaction proceeds, the session is told when it is ready")
-        pj.save_hook(hs)
-        rebuild(pj)
-        return 0
+            pj.log("PreCompact: everything up to the compaction is recorded; the compaction goes ahead")
+            return 0
+        pj.log("PreCompact: blocked the compaction: " + msg[:1500])
+        sys.stderr.write("Chronicle blocked this compaction: " + msg[:3000])
+        return 2
     elif ev == "SessionStart" and inp.get("source") in ("compact", "clear"):
         # only when the context was just emptied: a resumed session (the app restarting it) still holds everything, and
         # being told to reread now.md there doubles it in the context
@@ -1326,31 +1161,13 @@ def hook():
                    f"run `{pj.cfg['textimg'].replace(chr(92), '/')} {now} --max-pages 60` and open every PAGE it prints "
                    f"with the Read tool, in one parallel call. For an exact quote or number, Grep {pj.cfg['records_dir']}/ "
                    f"(the same records as text).")
-            if hs.get("pending"):
-                msg += (f" The part after {local(hs['pending'].get('from', ''))} is still being recorded; you will be told "
-                        f"when it is ready.")
             out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": msg}}
         elif recs:
             msg = (f"Chronicle: {pj.cfg['records_dir']}/now.md, loaded through CLAUDE.md, holds this session's own records "
                    f"(written from the complete transcript) up to {local(recs[-1]['end'])}: your memory of the work before "
                    f"this point, fuller than the compaction summary.")
-            if hs.get("pending"):
-                msg += (f" The part after {local(hs['pending'].get('from', ''))} is still being recorded; you will be told "
-                        f"when it is ready.")
             out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": msg}}
-    # an awaited tail record has finished: queue the one-time pointer and drop the pending mark
-    aw = hs["notes"].get("await")
-    if aw and not pid_alive(aw.get("pid")):
-        hs["notes"].pop("await")
-        hs.pop("pending", None)
-        recs = pj.load().get("records", [])
-        files = [r["file"] for r in recs if r["end"][:19] > (aw.get("after") or "")[:19] and r["start"][:19] <= (aw.get("until") or "9")[:19]]
-        if files:
-            hs["notes"]["ready"] = {"files": files, "told": []}
-        pj.save_hook(hs)
-        rebuild(pj)
-    else:
-        pj.save_hook(hs)
+    pj.save_hook(hs)
     if out:
         sys.stdout.write(json.dumps(out))
     return 0
@@ -1367,6 +1184,8 @@ def status(root):
         print(f"  file {os.path.basename(p)}: title={f.get('title')!r} pending={f.get('pending', 0)} ctx={f.get('ctx')}")
     if os.path.exists(pj.lock_path):
         print("  recorder running:", open(pj.lock_path).read())
+    if st.get("failure"):
+        print(f"  LAST RECORDING FAILED at {st['failure']['at']}: {st['failure']['error'][:400]}")
     now = os.path.join(pj.rec_dir, "now.md")
     if os.path.exists(now):
         print(f"  now.md: {os.path.getsize(now) // 1000} KB, ~{int(os.path.getsize(now) / CHARS_PER_TOKEN) // 1000}k tokens")
@@ -1385,10 +1204,8 @@ def main():
         proj = a[a.index("--project") + 1] if "--project" in a else None
         if "--max-parts" in a:
             MAX_PARTS[0] = int(a[a.index("--max-parts") + 1])
-        return record(a[1], final, n, proj)
-    if a[0] == "forksum":
-        proj = a[a.index("--project") + 1] if "--project" in a else None
-        return forksum(a[1], a[2], proj)
+        frm = a[a.index("--from") + 1] if "--from" in a else None
+        return record(a[1], final, n, proj, frm)
     if a[0] == "import-log":
         return import_log(find_root(a[1]) or a[1], a[2], "--dry" in a)
     if a[0] == "rebuild":
