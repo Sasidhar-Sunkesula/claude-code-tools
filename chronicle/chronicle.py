@@ -1148,6 +1148,10 @@ def scan_context(hs, transcript):
             continue
         u = (d.get("message") or {}).get("usage") if d.get("type") == "assistant" else None
         if u and str((d.get("message") or {}).get("model", "")).startswith("claude"):
+            # a message that used the advisor tool sums several model calls (the chat's passes and the advisor's) in
+            # its usage; the chat's context is its last pass
+            passes = [i for i in u.get("iterations") or [] if i.get("type") == "message"]
+            u = passes[-1] if passes else u
             ctx = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
     f["scan"] = off + end
     return ctx
