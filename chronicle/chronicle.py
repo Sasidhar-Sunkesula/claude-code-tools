@@ -633,6 +633,13 @@ def _record(pj, transcript, final, start_segments, from_ts=None):
         pj.log(f"record: starting after {from_ts}, as asked")
     elif last in fpos and (last in on or last in side):
         lp = fpos[last]
+    elif [u for u in st.get("tail_uuids", []) if u in fpos and (u in on or u in side)]:
+        # the last recorded entry is gone from this line (the app drops some of its own notices when it resumes or
+        # continues a session into a new transcript): go on after the latest recorded entry that is still on it
+        keep = [u for u in st["tail_uuids"] if u in fpos and (u in on or u in side)][-1]
+        lp = fpos[keep]
+        pj.log(f"record: the last recorded entry {last} is not on this line; going on after {keep}, the latest "
+               f"recorded entry still on it")
     elif last:
         end = (st.get("records") or [{}])[-1].get("end", "?")
         raise RuntimeError(
@@ -696,10 +703,12 @@ def _record(pj, transcript, final, start_segments, from_ts=None):
             items = [x for _, its in part for x in its]
             if not any(k in ("user", "reply", "thinking", "call", "result", "other") for k, _, _ in items):
                 st["last_uuid"] = part[-1][0]
+                st["tail_uuids"] = (st.get("tail_uuids", []) + [u for u, _ in part])[-200:]
                 pj.save(st)
                 continue
             write_part(pj, st, items, part, title)
             st["last_uuid"] = part[-1][0]
+            st["tail_uuids"] = (st.get("tail_uuids", []) + [u for u, _ in part])[-200:]
             pj.save(st)
             rebuild(pj)
     return 0
@@ -1107,6 +1116,10 @@ def _hook(inp, ev):
         return 0
     pj = Project(root)
     transcript = inp.get("transcript_path") or ""
+    if ev == "PreCompact" and transcript:
+        t_wait = time.time() + 30  # a session just continued into a new transcript may not have written it yet
+        while not os.path.isfile(transcript) and time.time() < t_wait:
+            time.sleep(1)
     if not transcript or not os.path.isfile(transcript):
         if ev == "PreCompact":
             raise RuntimeError(f"the session's transcript ({transcript or 'none given'}) cannot be read")
