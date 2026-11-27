@@ -97,28 +97,87 @@ class Project:
             f.write(f"{now_iso()} [{os.getpid()}] {msg}\n")
 
     def load(self):
-        try:
-            return json.load(open(self.state_path, encoding="utf-8"))
-        except Exception:
-            return {"records": [], "last_uuid": None, "files": {}, "notes": {}}
+        return read_json(self.state_path, lambda: {"records": [], "last_uuid": None})
 
     def save(self, st):
-        tmp = self.state_path + f".{os.getpid()}.tmp"
-        json.dump(st, open(tmp, "w", encoding="utf-8"), indent=1)
-        os.replace(tmp, self.state_path)
+        write_json(self.state_path, st)
 
-    # the hooks keep their own state (scan offsets, pending marks, notes); only the recorder writes state.json
+    # the hooks keep their own state (scan offsets, context sizes); only the recorder writes state.json. Every
+    # read-modify-write of hook.json happens under hook_lock: hooks run in parallel (one per parallel tool call)
     def load_hook(self):
-        try:
-            return json.load(open(os.path.join(self.st_dir, "hook.json"), encoding="utf-8"))
-        except Exception:
-            return {"files": {}, "notes": {}}
+        return read_json(os.path.join(self.st_dir, "hook.json"), lambda: {"files": {}})
 
     def save_hook(self, hs):
-        p = os.path.join(self.st_dir, "hook.json")
-        tmp = p + f".{os.getpid()}.tmp"
-        json.dump(hs, open(tmp, "w", encoding="utf-8"), indent=1)
-        os.replace(tmp, p)
+        write_json(os.path.join(self.st_dir, "hook.json"), hs)
+
+
+def replace_file(tmp, path):
+    """os.replace, waiting out the moment another process has the target open (Windows refuses the swap then)."""
+    for _ in range(200):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        os.remove(tmp)
+        raise
+
+
+def read_json(path, default):
+    """The file's JSON; default() only when the file does not exist. A read that collides with another process's
+    write is tried again; one that keeps failing raises (an unreadable state is never taken for an empty one)."""
+    for _ in range(200):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return default()
+        except (PermissionError, json.JSONDecodeError):
+            time.sleep(0.05)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path, obj):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1)
+    replace_file(tmp, path)
+
+
+class hook_lock:
+    """Serializes the hooks' read-modify-write of hook.json (a lock file; one left by a killed hook expires)."""
+
+    def __init__(self, pj):
+        self.path = os.path.join(pj.st_dir, "hook.lock")
+
+    def __enter__(self):
+        end = time.time() + 20
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                return self
+            except (FileExistsError, PermissionError):
+                try:
+                    if time.time() - os.path.getmtime(self.path) > 30:
+                        os.remove(self.path)
+                        continue
+                except OSError:
+                    pass
+                if time.time() > end:
+                    raise RuntimeError("the hooks' state stayed locked for 20 s")
+                time.sleep(0.01)
+
+    def __exit__(self, *exc):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
 
 
 def pid_alive(pid):
@@ -148,12 +207,19 @@ def take_lock(pj, wait_s):
             os.write(fd, json.dumps({"pid": os.getpid(), "since": now_iso()}).encode())
             os.close(fd)
             return True
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             try:
-                held = json.load(open(pj.lock_path, encoding="utf-8"))
-            except Exception:
-                held = {}
-            if not pid_alive(held.get("pid")):
+                with open(pj.lock_path, encoding="utf-8") as f:
+                    held = json.load(f)
+                stale = not pid_alive(held.get("pid"))
+            except FileNotFoundError:
+                continue  # released this instant
+            except Exception:  # being written this instant: stale only if it stays unreadable for a minute
+                try:
+                    stale = time.time() - os.path.getmtime(pj.lock_path) > 60
+                except OSError:
+                    continue
+            if stale:
                 try:
                     os.remove(pj.lock_path)
                 except OSError:
@@ -704,11 +770,11 @@ def _record(pj, transcript, final, start_segments, from_ts=None):
             if tok >= pj.cfg["part_tokens"] and not ends_with_call and not (nxt and nxt[0][0] == "result"):
                 parts.append(cur)
                 cur, tok = [], 0
+        if cur and not (final or closed):
+            while cur and any(x[0] == "call" for x in cur[-1][1]):  # its result is not in the transcript yet
+                cur.pop()
         if cur:
-            if final or closed:
-                parts.append(cur)
-            elif sum(sum(est(x) for x in its) for _, its in cur) >= pj.cfg["part_tokens"]:
-                parts.append(cur)
+            parts.append(cur)
         for part in parts:
             if MAX_PARTS[0] <= 0:
                 return 0
@@ -930,7 +996,7 @@ def rebuild(pj):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     now = os.path.join(pj.rec_dir, "now.md")
-    os.replace(tmp, now)
+    replace_file(tmp, now)
     return len(text)
 
 
@@ -1036,7 +1102,7 @@ def import_log(root, log_path, dry=False):
 
 # ---------------------------------------------------------------- hooks
 def tracked(pj, st, transcript):
-    """Whether this session is one the project records (title match and size)."""
+    """Whether this session is one the project records (title match, or size)."""
     f = st.setdefault("files", {}).setdefault(transcript, {})
     if "title" not in f:
         title = None
@@ -1056,44 +1122,34 @@ def tracked(pj, st, transcript):
     want = (pj.cfg.get("title_match") or "").lower()
     if want:
         return want in (f.get("title") or "").lower()
-    return f.get("ctx", 0) >= pj.cfg["min_context"] or bool(st.get("has_records"))
+    return st.get("ctx", 0) >= pj.cfg["min_context"] or bool(st.get("has_records"))
 
 
-def scan_growth(st, transcript):
-    """Tokens of new transcript since the last scan (cheap, incremental), and the latest context size."""
-    f = st["files"][transcript]
-    try:
-        size = os.path.getsize(transcript)
-    except OSError:
-        return 0, 0
+def scan_context(hs, transcript):
+    """The chat's latest context size (input + cache tokens of the newest assistant message), read incrementally from
+    the bytes added to the transcript since the last scan; None when no new assistant message has a usage."""
+    f = hs["files"][transcript]
+    size = os.path.getsize(transcript)
     off = f.get("scan")
-    if off is None or off > size:
-        f["scan"] = size
-        return 0, f.get("ctx", 0)
-    add, ctx = 0, f.get("ctx", 0)
+    if off is None or off > size:  # a file seen for the first time (or rewritten): its past is not new
+        off = max(0, size - 2_000_000)
     with open(transcript, "rb") as fh:
         fh.seek(off)
         data = fh.read(size - off)
     end = data.rfind(b"\n") + 1
+    ctx = None
     for raw in data[:end].split(b"\n"):
-        head = raw[:300]
-        if not raw or b'"api-request' in head or b'"isSidechain":true' in head:
+        if b'"usage"' not in raw or b'"type":"assistant"' not in raw or b'"isSidechain":true' in raw[:300]:
             continue
-        # "type" is searched in the whole line: newer transcripts put the message before it in assistant entries
-        if b'"type":"assistant"' in raw or b'"type":"user"' in raw[:4000] or b'"type":"attachment"' in raw[:4000]:
-            try:
-                d = json.loads(raw)
-            except Exception:
-                continue
-            calls = {}
-            for it in items_of(d, calls):
-                add += est(it)
-            u = (d.get("message") or {}).get("usage") if d.get("type") == "assistant" else None
-            if u:
-                ctx = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        u = (d.get("message") or {}).get("usage") if d.get("type") == "assistant" else None
+        if u and str((d.get("message") or {}).get("model", "")).startswith("claude"):
+            ctx = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
     f["scan"] = off + end
-    f["ctx"] = ctx
-    return add, ctx
+    return ctx
 
 
 GROWTH = ("PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop")
@@ -1179,49 +1235,53 @@ def _hook(inp, ev):
     transcript = inp.get("transcript_path") or ""
     if transcript and not os.path.isfile(transcript):
         # the desktop app continues a session into a new transcript (a new session id) and writes that file only
-        # after the hooks have run: the work so far is in the session's previous transcript, which the app's own
-        # record of the chat names
+        # after the hooks have run: the work so far is in the transcript the session was resumed from
         prev = previous_transcript(inp.get("session_id", ""), os.path.dirname(transcript))
         if prev:
-            pj_log = Project(root)
-            pj_log.log(f"{ev}: {os.path.basename(transcript)} is not written yet; using the session's previous "
-                       f"transcript {os.path.basename(prev)}")
+            pj.log(f"{ev}: {os.path.basename(transcript)} is not written yet; using the session's previous "
+                   f"transcript {os.path.basename(prev)}")
             transcript = prev
     if not transcript or not os.path.isfile(transcript):
         if ev == "PreCompact":
             raise RuntimeError(f"the session's transcript ({transcript or 'none given'}) cannot be read")
         return 0
     st = pj.load()  # recorder state: read only here
-    hs = pj.load_hook()
-    hs.setdefault("files", {}).setdefault(transcript, {})
-    hs["has_records"] = bool(st.get("records"))
-    for old in ("notes", "pending"):  # keys of an earlier design
-        hs.pop(old, None)
-    add = 0
-    if ev in GROWTH:
-        add, _ = scan_growth(hs, transcript)
-    if not tracked(pj, hs, transcript):
-        pj.save_hook(hs)
-        return 0
-    f = hs["files"][transcript]
     out = None
-    if ev in GROWTH:
-        f["pending"] = f.get("pending", 0) + add
-        if f["pending"] >= pj.cfg["chunk_tokens"] and not os.path.exists(pj.lock_path):
-            p = spawn(["record", transcript, "--project", pj.root], pj)
-            pj.log(f"hook {ev}: {f['pending']} new tokens; started recorder pid {p.pid}")
-            f["pending"] = 0
-        # a failed recording is shown to the user once; it stays in the state until a recording succeeds
-        fl = st.get("failure")
-        if fl and hs.get("failure_shown") != fl.get("at"):
-            hs["failure_shown"] = fl.get("at")
-            out = {"systemMessage": f"Chronicle: a recording failed at {local(fl.get('at', ''))}: "
-                                    f"{fl.get('error', '')[:600]} (log: {pj.cfg['state_dir']}/log.txt). The next "
-                                    f"compaction goes ahead only if everything up to it can be recorded then."}
-    elif ev == "PreCompact":
-        f["pending"] = 0
-        f["scan"] = os.path.getsize(transcript)
+    with hook_lock(pj):
+        hs = pj.load_hook()
+        hs.setdefault("files", {}).setdefault(transcript, {})
+        hs["has_records"] = bool(st.get("records"))
+        hs.pop("notes", None)  # an earlier design's keys
+        hs.pop("pending", None)
+        for f in hs["files"].values():
+            f.pop("pending", None)
+            f.pop("ctx", None)
+        if ev in GROWTH:
+            ctx = scan_context(hs, transcript)
+            if ctx is not None:
+                hs["ctx"] = ctx
+        if not tracked(pj, hs, transcript):
+            pj.save_hook(hs)
+            return 0
+        if ev in GROWTH:
+            # a recording starts each time the chat's context has grown chunk_tokens since the last one started (or
+            # since the compaction); it records everything not yet recorded
+            grown = hs.get("ctx", 0) - hs.get("base", 0)
+            if grown >= pj.cfg["chunk_tokens"] and not os.path.exists(pj.lock_path):
+                p = spawn(["record", transcript, "--project", pj.root], pj)
+                pj.log(f"hook {ev}: the context grew {grown} tokens to {hs['ctx']}; started recorder pid {p.pid}")
+                hs["base"] = hs["ctx"]
+            # a failed recording is shown to the user once; it stays in the state until a recording succeeds
+            fl = st.get("failure")
+            if fl and hs.get("failure_shown") != fl.get("at"):
+                hs["failure_shown"] = fl.get("at")
+                out = {"systemMessage": f"Chronicle: a recording failed at {local(fl.get('at', ''))}: "
+                                        f"{fl.get('error', '')[:600]} (log: {pj.cfg['state_dir']}/log.txt). The next "
+                                        f"compaction goes ahead only if everything up to it can be recorded then."}
+        elif ev == "PreCompact":
+            hs["base"] = 0  # the context starts over after the compaction
         pj.save_hook(hs)
+    if ev == "PreCompact":
         limit = pj.cfg["precompact_timeout"]
         t_end = time.time() + limit
         p = spawn(["record", transcript, "--final", "--project", pj.root], pj)
@@ -1242,7 +1302,7 @@ def _hook(inp, ev):
         pj.log("PreCompact: blocked the compaction: " + msg[:1500])
         sys.stderr.write("Chronicle blocked this compaction: " + msg[:3000])
         return 2
-    elif ev == "SessionStart" and inp.get("source") in ("compact", "clear"):
+    if ev == "SessionStart" and inp.get("source") in ("compact", "clear"):
         # only when the context was just emptied: a resumed session (the app restarting it) still holds everything, and
         # being told to reread now.md there doubles it in the context
         recs = st.get("records", [])
@@ -1260,7 +1320,6 @@ def _hook(inp, ev):
                    f"(written from the complete transcript) up to {local(recs[-1]['end'])}: your memory of the work before "
                    f"this point, fuller than the compaction summary.")
             out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": msg}}
-    pj.save_hook(hs)
     if out:
         sys.stdout.write(json.dumps(out))
     return 0
@@ -1273,8 +1332,9 @@ def status(root):
     print(f"project {root}; records {len(st.get('records', []))}; last entry {st.get('last_uuid')}")
     for r in st.get("records", [])[-10:]:
         print(f"  {r['file']}  {local(r['start'])} -> {local(r['end'])}  in ~{r['tokens_in'] // 1000}k  out {r['chars'] // 1000}k chars")
-    for p, f in pj.load_hook().get("files", {}).items():
-        print(f"  file {os.path.basename(p)}: title={f.get('title')!r} pending={f.get('pending', 0)} ctx={f.get('ctx')}")
+    hs = pj.load_hook()
+    print(f"  context {hs.get('ctx')} tokens; {hs.get('base', 0)} at the last recording's start (or the compaction); "
+          f"the next starts at {hs.get('base', 0) + pj.cfg['chunk_tokens']}")
     if os.path.exists(pj.lock_path):
         print("  recorder running:", open(pj.lock_path).read())
     if st.get("failure"):
