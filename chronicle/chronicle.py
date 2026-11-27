@@ -380,6 +380,19 @@ def items_of(e, calls):
     return out
 
 
+def trivial(item):
+    """An item with nothing to record: harness events, the /compact command, and the app's own reply to a command
+    ("No response requested.")."""
+    k, _, p = item
+    if k in ("event", "boundary", "summary"):
+        return True
+    if k == "user" and isinstance(p, str):
+        return p.strip().split(" ")[0] == "/compact"
+    if k == "reply":
+        return p.strip() == "No response requested."
+    return False
+
+
 def est(item):
     k, _, p = item
     if k == "result":
@@ -701,7 +714,7 @@ def _record(pj, transcript, final, start_segments, from_ts=None):
                 return 0
             MAX_PARTS[0] -= 1
             items = [x for _, its in part for x in its]
-            if not any(k in ("user", "reply", "thinking", "call", "result", "other") for k, _, _ in items):
+            if all(trivial(x) for x in items):  # nothing a record would hold: no summarizer call
                 st["last_uuid"] = part[-1][0]
                 st["tail_uuids"] = (st.get("tail_uuids", []) + [u for u, _ in part])[-200:]
                 pj.save(st)

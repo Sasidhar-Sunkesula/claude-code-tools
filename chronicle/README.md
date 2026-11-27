@@ -29,7 +29,8 @@ those records, not just the summary.
    texts don't already say: results it didn't report, files changed, decisions and reasons, dead ends, errors, jobs
    still running. Its own text has a target, not a limit, of `words_per_1k` words per 1k transcript tokens (default 5:
    about 5k words, or 7k tokens, per 1M), and the log and the record's header show what it used. With the verbatim
-   texts, a 1M stretch comes to roughly 15–20k tokens. A record whose placeholders are missing, repeated, unknown or out of order is
+   texts, a 1M stretch comes to roughly 15–20k tokens. A part with nothing to record (only `/compact` commands, the app's
+   "No response requested." and harness events) gets no record and no summarizer call. A record whose placeholders are missing, repeated, unknown or out of order is
    rejected, never repaired.
 4. **Before a compaction**, the `PreCompact` hook records everything not yet recorded, and the compaction waits for
    it. If the record can't be completed, the hook exits with code 2, which blocks the compaction, and Claude Code
