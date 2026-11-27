@@ -10,11 +10,14 @@ those records, not just the summary.
 
 ## How it works
 
-1. **While the session works.** A `PostToolUse` / `UserPromptSubmit` / `Stop` hook counts new transcript tokens. The
-   count reads only the bytes added since the last check, so it takes milliseconds. Every `chunk_tokens` (default
-   500k), the hook starts a detached recorder, which writes the new work as one record per `part_tokens` (default
-   500k): about two summarizer calls per 1M of transcript. A whole 1M can't be one call: the summarizer's window is
-   1M too, and real token counts run about 15% above the estimate.
+1. **While the session works.** A `PostToolUse` / `UserPromptSubmit` / `Stop` hook reads the chat's context size from
+   the API usage in the transcript, reading only the bytes added since the last check, so it takes milliseconds. It
+   carries over when the desktop app moves the chat to a new transcript file. Each time the context has grown
+   `chunk_tokens` (default 500k) since the last recording started (or since the compaction), the hook starts a
+   detached recorder, which records everything not yet recorded: about two summarizer calls per 1M. A record holds at
+   most `part_tokens` (default 700k) of transcript, so a recording is one call; a whole 1M can't be, because the
+   summarizer's window is 1M too and real token counts run up to 15% above the estimate. The hooks' state is updated
+   under a lock, since parallel tool calls fire hooks at once.
 2. **The recorder** walks the session's main line, following compaction boundaries, from the last recorded entry. It
    renders the new part in order and sends it in one call to `claude -p --model claude-opus-5-5 --effort xhigh`:
    - every user message, message to the user, tool call with its full input, and tool result with full text and every image;

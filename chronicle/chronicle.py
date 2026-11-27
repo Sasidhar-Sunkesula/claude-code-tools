@@ -24,9 +24,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {
     "title_match": "",            # record only sessions whose title contains this (case-insensitive); "" = any
     "min_context": 150000,        # ...and only once their context has grown past this many tokens
-    "chunk_tokens": 500000,       # new transcript tokens that start a background recording: about 2 per 1M
-    "part_tokens": 500000,        # transcript tokens per record (one summarizer call; real tokens run ~15% above this
-                                  # estimate, and the summarizer's window is 1M, so a whole 1M stretch cannot be one)
+    "chunk_tokens": 500000,       # context growth (API tokens) that starts a background recording: about 2 per 1M
+    "part_tokens": 700000,        # most transcript tokens per record, one summarizer call: real tokens run up to ~15%
+                                  # above this estimate and the summarizer's window is 1M, so a recording (which comes
+                                  # every ~500k) is one call
     "words_per_1k": 5,            # the summarizer's own words per 1k transcript tokens (a target, not a limit), beside
                                   # the verbatim messages, replies and acts: about 5k words (7k tokens) per 1M, so a
                                   # 1M stretch comes to roughly 15-20k tokens with them
