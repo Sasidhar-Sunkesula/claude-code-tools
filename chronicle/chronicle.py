@@ -1102,6 +1102,24 @@ def hook():
         return hook_error(ev, "".join(traceback.format_exception(ex))[-1500:])
 
 
+def previous_transcript(sid, folder):
+    """The newest existing transcript among the earlier ids of a desktop-app session (its record in the app's
+    claude-code-sessions folder lists them), or None."""
+    base = os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code-sessions")
+    for rec in glob.glob(os.path.join(base, "*", "*", "local_*.json")):
+        try:
+            d = json.load(open(rec, encoding="utf-8"))
+        except Exception:
+            continue
+        if d.get("cliSessionId") != sid:
+            continue
+        for p in reversed(d.get("priorCliSessionIds") or []):
+            f = os.path.join(folder, p + ".jsonl")
+            if os.path.isfile(f):
+                return f
+    return None
+
+
 def hook_error(ev, msg):
     if ev == "PreCompact":
         sys.stderr.write("Chronicle blocked this compaction: " + msg)
@@ -1116,10 +1134,16 @@ def _hook(inp, ev):
         return 0
     pj = Project(root)
     transcript = inp.get("transcript_path") or ""
-    if ev == "PreCompact" and transcript:
-        t_wait = time.time() + 30  # a session just continued into a new transcript may not have written it yet
-        while not os.path.isfile(transcript) and time.time() < t_wait:
-            time.sleep(1)
+    if ev == "PreCompact" and transcript and not os.path.isfile(transcript):
+        # the desktop app continues a session into a new transcript (a new session id) and writes that file only
+        # after the hooks have run: the work so far is in the session's previous transcript, which the app's own
+        # record of the chat names
+        prev = previous_transcript(inp.get("session_id", ""), os.path.dirname(transcript))
+        if prev:
+            pj_log = Project(root)
+            pj_log.log(f"PreCompact: {os.path.basename(transcript)} is not written yet; recording from the session's "
+                       f"previous transcript {os.path.basename(prev)}")
+            transcript = prev
     if not transcript or not os.path.isfile(transcript):
         if ev == "PreCompact":
             raise RuntimeError(f"the session's transcript ({transcript or 'none given'}) cannot be read")
